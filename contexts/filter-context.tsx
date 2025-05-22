@@ -8,6 +8,7 @@ export interface FilterState {
   targetGeneration: string
   source: string
   category: string
+  country: string
 }
 
 interface FilterContextType {
@@ -22,6 +23,7 @@ const defaultFilters: FilterState = {
   targetGeneration: "all",
   source: "all",
   category: "all",
+  country: "hu"
 }
 
 const FilterContext = createContext<FilterContextType | undefined>(undefined)

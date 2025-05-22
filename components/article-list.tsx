@@ -1,11 +1,11 @@
 "use client"
 
-import { useEffect, useState } from "react"
+import { useEffect, useState, useCallback } from "react"
 import Link from "next/link"
 import { Card, CardContent, CardFooter } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { formatDistanceToNow } from "date-fns"
-import { AlertTriangle, BarChart3, Target, AlertCircle, RefreshCw, Trash2, Loader2 } from "lucide-react"
+import { AlertTriangle, BarChart3, Target, AlertCircle, RefreshCw, Trash2, Loader2, Gauge, BookOpen, Heart, TrendingUp, Zap } from "lucide-react"
 import ArticleMetricBadge from "./article-metric-badge"
 import { useFilters } from "@/contexts/filter-context"
 import type { Article } from "@/types/article"
@@ -13,42 +13,75 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import { toast } from "@/hooks/use-toast"
 
+interface ArticleListState {
+  articles: Article[];
+  filteredArticles: Article[];
+  isLoading: boolean;
+  isRefreshing: boolean;
+  isDeleting: boolean;
+  error: string | null;
+  analysisErrors: string[];
+}
+
 export default function ArticleList() {
-  const [articles, setArticles] = useState<Article[]>([])
-  const [filteredArticles, setFilteredArticles] = useState<Article[]>([])
-  const [isLoading, setIsLoading] = useState(true)
-  const [isRefreshing, setIsRefreshing] = useState(false)
-  const [isDeleting, setIsDeleting] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-  const [analysisErrors, setAnalysisErrors] = useState<string[]>([])
-  const { filters } = useFilters()
+  const [state, setState] = useState<ArticleListState>({
+    articles: [],
+    filteredArticles: [],
+    isLoading: true,
+    isRefreshing: false,
+    isDeleting: false,
+    error: null,
+    analysisErrors: []
+  });
+  
+  const { filters } = useFilters();
+  
+  // Helper functions to update state
+  const setArticles = (updater: Article[] | ((prev: Article[]) => Article[])) => {
+    setState(prev => {
+      const newArticles = typeof updater === 'function' 
+        ? updater(prev.articles) 
+        : updater;
+      return { ...prev, articles: newArticles };
+    });
+  };
+  
+  const setFilteredArticles = (filteredArticles: Article[]) => setState(prev => ({ ...prev, filteredArticles }));
+  const setIsLoading = (isLoading: boolean) => setState(prev => ({ ...prev, isLoading }));
+  const setIsRefreshing = (isRefreshing: boolean) => setState(prev => ({ ...prev, isRefreshing }));
+  const setIsDeleting = (isDeleting: boolean) => setState(prev => ({ ...prev, isDeleting }));
+  const setError = (error: string | null) => setState(prev => ({ ...prev, error }));
+  const setAnalysisErrors = (analysisErrors: string[]) => setState(prev => ({ ...prev, analysisErrors }));
+  
+  // Destructure state for easier access
+  const { articles, filteredArticles, isLoading, isRefreshing, isDeleting, error, analysisErrors } = state;
 
   // Delete all articles
   const deleteAllArticles = async () => {
     try {
-      setIsDeleting(true)
-      setError(null)
+      setIsDeleting(true);
+      setError(null);
 
       const response = await fetch("/api/articles/delete-all", {
         method: "DELETE",
-      })
+      });
 
       if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}))
-        throw new Error(errorData.error || `API error: ${response.status}`)
+        const errorData = await response.json().catch(() => ({}));
+        throw new Error(errorData.error || `API error: ${response.status}`);
       }
 
-      const data = await response.json()
-      console.log("Delete all articles response:", data)
+      const data = await response.json();
+      console.log("Delete all articles response:", data);
 
       // Clear the articles state
-      setArticles([])
-      setFilteredArticles([])
+      setArticles([]);
+      setFilteredArticles([]);
 
       toast({
         title: "Articles Deleted",
         description: `Successfully deleted ${data.deletedCount} articles.`,
-      })
+      });
     } catch (error) {
       console.error("Failed to delete articles:", error)
       setError(`Failed to delete articles: ${error instanceof Error ? error.message : "Unknown error"}`)
@@ -63,95 +96,114 @@ export default function ArticleList() {
     }
   }
 
-  // Fetch articles
-  const fetchArticles = async (refresh = false) => {
+  // Fetch articles with proper TypeScript types and error handling
+  const fetchArticles = useCallback(async (loadMore = false) => {
     try {
-      if (refresh) {
-        setIsRefreshing(true)
-
-        // Trigger cleanup when refreshing
-        try {
-          await fetch("/api/cleanup")
-        } catch (cleanupError) {
-          console.error("Error cleaning up old articles:", cleanupError)
-          // Continue even if cleanup fails
-        }
+      // Set loading states
+      if (loadMore) {
+        setIsRefreshing(true);
       } else {
-        setIsLoading(true)
+        setIsLoading(true);
       }
-      setError(null)
-      setAnalysisErrors([])
+      
+      setError(null);
+      setAnalysisErrors([]);
 
       // Build the API URL with query parameters
-      const url = new URL("/api/articles", window.location.origin)
+      const apiUrl = new URL("/api/articles", window.location.origin);
+      
+      // Add country parameter (defaults to 'hu' for Hungary)
+      apiUrl.searchParams.append("country", filters.country || "hu");
+      
+      // Add category filter if not 'all'
       if (filters.category !== "all") {
-        url.searchParams.append("category", filters.category)
+        apiUrl.searchParams.append("category", filters.category);
       }
-      if (refresh) {
-        url.searchParams.append("refresh", "true")
+      
+      // Add refresh parameter if loading more
+      if (loadMore) {
+        apiUrl.searchParams.append("refresh", "true");
       }
+      
       // Add parameter to include unanalyzed articles
-      url.searchParams.append("includeUnanalyzed", "true")
+      apiUrl.searchParams.append("includeUnanalyzed", "true");
 
-      const response = await fetch(url.toString())
-      if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}))
-        throw new Error(errorData.error || `API error: ${response.status}`)
+      // Make the API request
+      const apiResponse = await fetch(apiUrl.toString());
+      if (!apiResponse.ok) {
+        const errorData = await apiResponse.json().catch(() => ({}));
+        throw new Error(errorData.error || `API error: ${apiResponse.status}`);
       }
 
-      const data = await response.json()
+      const responseData = await apiResponse.json();
 
-      if (data.error) {
-        throw new Error(data.error)
+      if (responseData.error) {
+        throw new Error(responseData.error);
       }
 
-      // Check for analysis errors
-      if (data.errors && data.errors.length > 0) {
-        setAnalysisErrors(data.errors)
-
-        // Show toast for analysis errors
-        if (refresh) {
+      // Handle analysis errors if any
+      if (responseData.errors?.length > 0) {
+        setAnalysisErrors(responseData.errors);
+        
+        // Show toast for analysis errors if loading more
+        if (loadMore) {
           toast({
             variant: "warning",
             title: "Analysis Issues",
-            description: `${data.errors.length} articles had analysis issues.`,
-          })
+            description: `${responseData.errors.length} articles had analysis issues.`,
+          });
         }
       }
 
-      // Include all articles, both analyzed and unanalyzed
-      setArticles(data.articles || [])
-
-      // Show toast for successful refresh
-      if (refresh) {
-        toast({
-          title: "Articles Refreshed",
-          description: `Successfully loaded ${data.articles.length} articles.`,
-        })
+      // Update articles based on whether we're loading more or doing initial load
+      if (loadMore) {
+        // When loading more, append new articles to the existing ones
+        setArticles(prevArticles => {
+          const existingUrls = new Set(prevArticles.map(article => article.url));
+          const newArticles = (responseData.articles || []).filter((article: Article) => 
+            !existingUrls.has(article.url)
+          );
+          
+          if (newArticles.length > 0) {
+            toast({
+              title: "New Articles Loaded",
+              description: `Added ${newArticles.length} new articles.`,
+            });
+            return [...prevArticles, ...newArticles];
+          } else {
+            toast({
+              title: "No New Articles",
+              description: "No new articles to show.",
+            });
+            return prevArticles;
+          }
+        });
+      } else {
+        // Initial load, just set the articles
+        setArticles(responseData.articles || []);
       }
-    } catch (error) {
-      console.error("Failed to fetch articles:", error)
-      setError(`Failed to load articles: ${error instanceof Error ? error.message : "Unknown error"}`)
+    } catch (error: any) {
+      console.error("Failed to fetch articles:", error);
+      const errorMessage = `Failed to ${loadMore ? 'load more' : 'fetch'} articles: ${error instanceof Error ? error.message : 'Unknown error'}`;
+      setError(errorMessage);
 
-      if (refresh) {
-        toast({
-          variant: "destructive",
-          title: "Error",
-          description: `Failed to refresh articles: ${error instanceof Error ? error.message : "Unknown error"}`,
-        })
-      }
+      toast({
+        variant: "destructive",
+        title: "Error",
+        description: errorMessage,
+      });
     } finally {
-      setIsLoading(false)
-      setIsRefreshing(false)
+      setIsLoading(false);
+      setIsRefreshing(false);
     }
-  }
+  }, [filters.category, filters.country]); // Recreate when filters.category or filters.country changes
 
   // Poll for updates to check if unanalyzed articles have been analyzed
   useEffect(() => {
     // Only poll if there are unanalyzed articles
-    const hasUnanalyzedArticles = articles.some((article) => article.analyzed === false)
+    const hasUnanalyzedArticles = articles.some((article) => article.analyzed === false);
 
-    if (!hasUnanalyzedArticles) return
+    if (!hasUnanalyzedArticles) return;
 
     const pollInterval = setInterval(() => {
       // Only fetch if we're not already loading or refreshing
@@ -163,9 +215,12 @@ export default function ArticleList() {
     return () => clearInterval(pollInterval)
   }, [articles, isLoading, isRefreshing])
 
-  // Fetch articles when component mounts or when category filter changes
+  // Fetch articles when component mounts (only if not already loaded) or when category filter changes
   useEffect(() => {
-    fetchArticles()
+    // Only fetch if we don't have any articles yet
+    if (articles.length === 0) {
+      fetchArticles()
+    }
   }, [filters.category])
 
   // Apply filters whenever they change or articles change
@@ -173,8 +228,8 @@ export default function ArticleList() {
     if (!articles.length) return
 
     const filtered = articles.filter((article) => {
-      // Include unanalyzed articles
-      if (article.analyzed === false) return true
+      // Only include articles that have been successfully analyzed
+      if (article.analyzed !== true) return false
 
       // Skip articles that don't have metrics
       if (!article.metrics) return false
@@ -259,7 +314,7 @@ export default function ArticleList() {
             <Trash2 className="ml-2 h-4 w-4" />
           </Button>
           <Button onClick={() => fetchArticles(true)} size="sm" variant="outline" disabled={isRefreshing}>
-            {isRefreshing ? "Refreshing..." : "Refresh"}
+            {isRefreshing ? "Loading..." : "Load More"}
             <RefreshCw className={`ml-2 h-4 w-4 ${isRefreshing ? "animate-spin" : ""}`} />
           </Button>
         </div>
@@ -358,7 +413,7 @@ export default function ArticleList() {
                     <h2 className="mb-2 line-clamp-2 text-xl font-bold">{article.title}</h2>
                     <p className="line-clamp-3 text-sm text-muted-foreground">{article.summary}</p>
                   </CardContent>
-                  <CardFooter className="flex flex-wrap gap-2 border-t p-4">
+                  <CardFooter className="grid grid-cols-2 gap-2 border-t p-4">
                     <ArticleMetricBadge
                       icon={<AlertTriangle size={14} />}
                       label="Clickbait"
@@ -372,9 +427,36 @@ export default function ArticleList() {
                       colorScale="high-bad"
                     />
                     <ArticleMetricBadge
+                      icon={<Gauge size={14} />}
+                      label="Sentiment"
+                      value={article.metrics.sentimentScore}
+                      colorScale="high-good"
+                    />
+                    <ArticleMetricBadge
+                      icon={<BookOpen size={14} />}
+                      label="Readability"
+                      value={article.metrics.readabilityScore}
+                      colorScale="high-good"
+                    />
+                    <ArticleMetricBadge
+                      icon={<Zap size={14} />}
+                      label="Tone"
+                      text={article.metrics.sentimentTone}
+                    />
+                    <ArticleMetricBadge
+                      icon={<Heart size={14} />}
+                      label="Emotion"
+                      text={article.metrics.emotionalTone}
+                    />
+                    <ArticleMetricBadge
                       icon={<Target size={14} />}
                       label="Target"
                       text={article.metrics.targetGeneration}
+                    />
+                    <ArticleMetricBadge
+                      icon={<TrendingUp size={14} />}
+                      label="Level"
+                      text={article.metrics.readingLevel}
                     />
                   </CardFooter>
                 </Link>

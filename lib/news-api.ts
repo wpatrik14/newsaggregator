@@ -33,13 +33,23 @@ interface NewsApiResponse {
 // Helper function to add delay between requests
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
+// Track the current page for pagination
+let currentPage = 1
+
 // Fetch top headlines from News API
 export async function fetchTopHeadlines(
   country = "us",
   category?: string,
   pageSize = 5, // Changed to 5 articles
-  page = 1,
+  page?: number, // Make page optional
 ): Promise<{ articles: Article[]; errors: string[] }> {
+  // If page is not provided, use the next page
+  const pageToFetch = page || currentPage++
+  
+  // Reset to page 1 if we've gone too far (News API has a limit)
+  if (pageToFetch > 5) {
+    currentPage = 1
+  }
   try {
     console.log(`Fetching top headlines: country=${country}, category=${category || "all"}`)
 
@@ -56,7 +66,9 @@ export async function fetchTopHeadlines(
       url.searchParams.append("category", category)
     }
     url.searchParams.append("pageSize", pageSize.toString())
-    url.searchParams.append("page", page.toString())
+    url.searchParams.append("page", pageToFetch.toString())
+    
+    console.log(`Fetching page ${pageToFetch} of results`)
 
     // Make the request to News API
     console.log(`Making request to News API: ${url.toString()}`)
@@ -180,7 +192,7 @@ async function analyzeArticleInBackground(article: Article, title: string, conte
     await delay(1000)
 
     // Analyze the article with AI
-    const metrics = await analyzeArticle(title, content)
+    const { metrics, summary } = await analyzeArticle(title, content)
 
     console.log(`Analysis successful for article: "${title.substring(0, 30)}..."`)
     console.log(
@@ -191,6 +203,8 @@ async function analyzeArticleInBackground(article: Article, title: string, conte
     const updatedArticle: Article = {
       ...article,
       metrics,
+      summary,
+      content: summary, // Update content with the summary
       analyzed: true, // Mark as analyzed
     }
 

@@ -57,46 +57,47 @@ export async function storeArticle(article: Article): Promise<string> {
 async function checkDuplicateArticle(article: Article): Promise<string | null> {
   try {
     // List all blobs with the articles prefix
-    const { blobs } = await list({ prefix: ARTICLES_PREFIX, limit: 20 }) // Limit to 20 most recent blobs
+    const { blobs } = await list({ prefix: ARTICLES_PREFIX, limit: 50 }) // Increased limit to check more articles
 
     // If no blobs, no duplicates
     if (blobs.length === 0) {
-      return null
+      return null;
     }
 
-    // Extract URLs and titles for comparison without fetching content
-    // This is a more efficient approach that doesn't require fetching each blob
-    const duplicateByUrl = blobs.find((blob) => {
-      // Extract ID from the path
-      const pathParts = blob.pathname.split("/")
-      const filename = pathParts[pathParts.length - 1]
-      const id = filename.replace(".json", "")
+    // First, check if we can find a match by URL without fetching content
+    for (const blob of blobs) {
+      try {
+        // Extract ID from the path
+        const pathParts = blob.pathname.split("/");
+        const filename = pathParts[pathParts.length - 1];
+        const id = filename.replace(".json", "");
 
-      // Skip the current article if it's being updated
-      if (id === article.id) {
-        return false
+        // Skip the current article if it's being updated
+        if (id === article.id) {
+          continue;
+        }
+
+        // If the URL is in the blob's path, it's likely a duplicate
+        if (blob.pathname.includes(encodeURIComponent(article.url))) {
+          return blob.url;
+        }
+      } catch (error) {
+        console.error("Error checking blob path:", error);
+        continue;
       }
-
-      return true // For now, we'll check all blobs
-    })
-
-    // If no potential duplicates found by filename, return null
-    if (!duplicateByUrl) {
-      return null
     }
 
-    // Now we'll check a limited number of blobs by content
-    // We'll only check up to 5 blobs to avoid rate limiting
-    const blobsToCheck = blobs.slice(0, 5)
+    // If no match found by path, check the content of a limited number of blobs
+    const blobsToCheck = blobs.slice(0, 10); // Check up to 10 most recent blobs
 
     for (const blob of blobsToCheck) {
       try {
         // Add a small delay between requests to avoid rate limiting
-        await delay(RATE_LIMIT_DELAY)
+        await delay(RATE_LIMIT_DELAY);
 
         // Use a timeout to prevent hanging requests
-        const controller = new AbortController()
-        const timeoutId = setTimeout(() => controller.abort(), 5000) // 5 second timeout
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 5000); // 5 second timeout
 
         const response = await fetch(blob.url, {
           signal: controller.signal,
@@ -116,41 +117,59 @@ async function checkDuplicateArticle(article: Article): Promise<string | null> {
 
           // If we're being rate limited, wait longer and skip this check
           if (response.status === 429) {
-            console.warn("Rate limited by Blob storage API, skipping duplicate check")
-            return null // Skip duplicate check rather than failing
+            console.warn("Rate limited by Blob storage API, skipping duplicate check");
+            return null; // Skip duplicate check rather than failing
           }
 
-          continue // Skip this blob and try the next one
+          continue; // Skip this blob and try the next one
         }
 
-        // Try to parse the response as JSON
-        const text = await response.text()
-        let existingArticle: Article
+        const existingArticle: Article = await response.json();
 
-        try {
-          existingArticle = JSON.parse(text) as Article
-        } catch (parseError) {
-          console.error(`Invalid JSON from ${blob.url}: ${text.substring(0, 50)}...`)
-          continue // Skip this blob and try the next one
+        // Check if the URLs match (case insensitive and ignoring URL parameters)
+        const normalizeUrl = (url: string) => {
+          try {
+            const u = new URL(url);
+            // Remove query parameters and hash, and normalize the URL
+            return `${u.protocol}//${u.hostname}${u.pathname}`
+              .replace(/\/$/, '') // Remove trailing slash
+              .toLowerCase();
+          } catch (e) {
+            return url.toLowerCase();
+          }
+        };
+
+        const normalizedNewUrl = normalizeUrl(article.url);
+        const normalizedExistingUrl = existingArticle.url ? normalizeUrl(existingArticle.url) : '';
+
+        if (normalizedNewUrl === normalizedExistingUrl) {
+          console.log(`Found duplicate article by URL: ${article.url}`);
+          return blob.url;
         }
 
-        // Check if URLs match (primary duplicate check)
-        if (existingArticle.url === article.url) {
-          return blob.url
+        // Additional check for similar URLs with different protocols (http vs https)
+        if (normalizedNewUrl.replace(/^https?:/, '') === normalizedExistingUrl.replace(/^https?:/, '')) {
+          console.log(`Found duplicate article by URL (different protocols): ${article.url}`);
+          return blob.url;
         }
 
-        // Secondary check: if titles are very similar and from same source
-        if (existingArticle.source === article.source && similarTitles(existingArticle.title, article.title)) {
-          return blob.url
+        // Also check if the titles are similar (as a fallback)
+        if (
+          existingArticle.title &&
+          article.title &&
+          similarTitles(existingArticle.title, article.title)
+        ) {
+          console.log(`Found similar article by title: ${article.title}`);
+          return blob.url;
         }
       } catch (error) {
         // If fetch fails for a specific blob, log and continue with the next one
-        console.error(`Error checking article at ${blob.url}:`, error)
-        continue // Skip this blob and try the next one
+        console.error(`Error checking article at ${blob.url}:`, error);
+        continue; // Skip this blob and try the next one
       }
     }
 
-    return null // No duplicates found
+    return null; // No duplicates found
   } catch (error) {
     // If the overall process fails, log and rethrow
     console.error("Error checking for duplicate articles:", error)

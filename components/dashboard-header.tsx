@@ -3,6 +3,7 @@
 import { useState } from "react"
 import Link from "next/link"
 import { ModeToggle } from "./mode-toggle"
+import { CountrySelector } from "./country-selector"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Search, Menu, X } from "lucide-react"
@@ -30,6 +31,7 @@ export default function DashboardHeader() {
         </div>
 
         <div className="flex items-center gap-2">
+          <CountrySelector />
           <ModeToggle />
         </div>
       </div>

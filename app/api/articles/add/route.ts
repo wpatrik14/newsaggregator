@@ -12,23 +12,25 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: "Missing required fields: title, content" }, { status: 400 })
     }
 
-    // Analyze the article with AI
-    const metrics = await analyzeArticle(title, content)
+    // Analyze the article with AI and get metrics + summary
+    const { metrics, summary: aiSummary } = await analyzeArticle(title, content)
 
     // Create a unique ID for the article
     const id = uuidv4()
 
-    // Create the article object
+    // Create the article object with the AI-generated summary
     const article: Article = {
       id,
       title,
-      summary: summary || content.substring(0, 150) + "...",
-      content,
+      summary: aiSummary,
+      content: aiSummary, // Use the summary as content
       url: url || "",
       imageUrl: "/placeholder.svg?height=400&width=600",
       source: source || "Manual Entry",
       publishedAt: new Date().toISOString(),
       metrics,
+      analyzed: true, // Mark as analyzed since we just analyzed it
+      storedAt: new Date().toISOString() // Add timestamp
     }
 
     // Store the article in Blob storage

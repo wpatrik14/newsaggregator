@@ -23,29 +23,32 @@ export async function GET(request: Request) {
       )
     }
 
-    if (refresh) {
-      // Fetch fresh articles from News API
-      const result = await fetchTopHeadlines(country, category, pageSize, page)
-      articles = result.articles
-      errors = result.errors
+    // Always try to get articles from Blob storage first
+    const storedArticles = await listArticlesFromBlob()
+
+    // Filter articles based on includeUnanalyzed parameter
+    if (includeUnanalyzed) {
+      articles = storedArticles // Include all articles
     } else {
-      // Try to get articles from Blob storage first
-      const storedArticles = await listArticlesFromBlob()
+      // Only return articles that have been analyzed
+      articles = storedArticles.filter((article) => article.analyzed === true)
+    }
 
-      // Filter articles based on includeUnanalyzed parameter
-      if (includeUnanalyzed) {
-        articles = storedArticles // Include all articles
+    // If no articles in Blob storage or refresh is requested, fetch from News API
+    if (refresh || articles.length === 0) {
+      const result = await fetchTopHeadlines(country, category, pageSize, page)
+      
+      if (refresh) {
+        // When refreshing, keep existing articles and add new ones
+        const existingUrls = new Set(articles.map(article => article.url))
+        const newArticles = result.articles.filter(article => !existingUrls.has(article.url))
+        articles = [...articles, ...newArticles]
       } else {
-        // Only return articles that have been analyzed
-        articles = storedArticles.filter((article) => article.analyzed === true)
-      }
-
-      // If no articles in Blob storage, fetch from News API
-      if (articles.length === 0) {
-        const result = await fetchTopHeadlines(country, category, pageSize, page)
+        // When no articles exist, use the fetched ones
         articles = result.articles
-        errors = result.errors
       }
+      
+      errors = result.errors
     }
 
     return NextResponse.json({ articles, errors })
