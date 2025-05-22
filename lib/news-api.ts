@@ -141,10 +141,6 @@ export async function fetchTopHeadlines(
         }
 
         try {
-          // Store the unanalyzed article in Blob storage
-          console.log(`Storing unanalyzed article in Blob storage: "${article.title.substring(0, 30)}..."`)
-          await storeArticle(newArticle)
-
           // Add the unanalyzed article to the response
           processedArticles.push(newArticle)
 
