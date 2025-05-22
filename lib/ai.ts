@@ -2,23 +2,42 @@ import type { ArticleMetrics } from "@/types/article"
 import { generateText } from "ai"
 import { openai } from "@ai-sdk/openai"
 
-export async function generateSummary(content: string, maxLength: number = 200): Promise<string> {
+export async function generateSummary(content: string, maxLength: number = 2000): Promise<string> {
   try {
     const { text } = await generateText({
       model: openai("gpt-4o"),
-      prompt: `Please provide a concise summary of the following content in ${maxLength} characters or less. Focus on the main points and key information.\n\nContent: ${content.substring(0, 2000)}`,
+      prompt: `Please provide a detailed summary of the following content in ${maxLength} characters or less. Use bullet points to highlight key information and main points. Include the most important facts, figures, and conclusions.\n\nContent: ${content.substring(0, 4000)}`,
       temperature: 0.3,
-      maxTokens: 200,
+      maxTokens: 500,
     });
-    return text.trim();
+    
+    // Format the response to ensure bullet points
+    let formattedText = text.trim();
+    
+    // Ensure proper bullet point formatting
+    if (!formattedText.includes('•') && !formattedText.includes('-') && !formattedText.includes('*')) {
+      // Split into sentences and add bullet points
+      const sentences = formattedText.split('. ');
+      formattedText = sentences.map(sentence => 
+        sentence.trim() ? `• ${sentence.trim()}${sentence.endsWith('.') ? '' : '.'}` : ''
+      ).filter(Boolean).join('\n');
+    }
+    
+    // Ensure the summary doesn't exceed maxLength
+    if (formattedText.length > maxLength) {
+      formattedText = formattedText.substring(0, maxLength - 3) + '...';
+    }
+    
+    return formattedText;
   } catch (error) {
     console.error('Error generating summary:', error);
     // Fallback to a simple truncation if AI summary fails
-    return content.substring(0, maxLength) + (content.length > maxLength ? '...' : '');
+    const fallback = content.substring(0, maxLength) + (content.length > maxLength ? '...' : '');
+    return `• ${fallback.replace(/\. /g, '.\n• ')}`;
   }
 }
 
-export async function analyzeArticle(title: string, content: string): Promise<{metrics: ArticleMetrics, summary: string}> {
+export async function analyzeArticle(title: string, content: string): Promise<{metrics: ArticleMetrics, summary: string, aiSummary: string}> {
   try {
     // Check if OpenAI API key is available
     const apiKey = process.env.OPENAI_API_KEY
@@ -97,13 +116,15 @@ export async function analyzeArticle(title: string, content: string): Promise<{m
       ], 'Neutral')
     }
 
-    // Generate a summary of the content
+    // Generate a detailed summary (2000 characters) and a short summary (200 characters)
+    const aiSummary = await generateSummary(content, 2000);
     const summary = await generateSummary(content, 200);
     
     console.log(`Successfully analyzed article: "${title.substring(0, 30)}..."`)
     return {
       metrics: result,
-      summary
+      summary,
+      aiSummary
     }
   } catch (error) {
     console.error("Error analyzing article with AI:", error)
