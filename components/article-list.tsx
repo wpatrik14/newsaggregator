@@ -430,8 +430,37 @@ export default function ArticleList() {
         }
       }
 
-      // Update articles based on whether we're loading more or doing initial load
-      if (loadMore) {
+      // Update articles based on whether we're loading more, polling, or doing initial load
+      if (isPollingCall) {
+        // When polling, merge the updated articles with existing ones
+        setArticles(prevArticles => {
+          const updatedArticles = [...prevArticles];
+          const updatedUrls = new Set<string>();
+          
+          // Update existing articles that have been analyzed
+          responseData.articles.forEach((updatedArticle: Article) => {
+            const existingIndex = updatedArticles.findIndex(a => a.id === updatedArticle.id);
+            if (existingIndex >= 0) {
+              // Update existing article
+              updatedArticles[existingIndex] = {
+                ...updatedArticles[existingIndex],
+                ...updatedArticle,
+                analyzed: true // Ensure analyzed is set to true
+              };
+            } else if (updatedArticle.analyzed) {
+              // Only add new articles if they're already analyzed
+              updatedArticles.push(updatedArticle);
+            }
+            updatedUrls.add(updatedArticle.id);
+          });
+          
+          // If we didn't get any updates, no need to trigger a re-render
+          if (updatedUrls.size === 0) return prevArticles;
+          
+          console.log(`Updated ${updatedUrls.size} articles with analysis`);
+          return updatedArticles;
+        });
+      } else if (loadMore) {
         // When loading more, append new articles to the existing ones
         setArticles(prevArticles => {
           const existingUrls = new Set(prevArticles.map(article => article.url));
@@ -480,14 +509,14 @@ export default function ArticleList() {
   // Track if initial fetch has been done
   const initialFetchDone = useRef(false);
 
-  // Fetch articles when component mounts (only if not already loaded) or when category filter changes
+  // Fetch articles when component mounts or when category filter changes
   useEffect(() => {
-    // Only fetch if we don't have any articles yet and we haven't done the initial fetch
-    if (articles.length === 0 && !initialFetchDone.current) {
+    // Only fetch on initial mount or when category changes, not when articles are deleted
+    if (!initialFetchDone.current) {
       initialFetchDone.current = true;
       fetchArticles();
     }
-  }, [articles.length, filters.category]);
+  }, [filters.category]); // Only depend on category changes
 
   // Poll for updates to check if unanalyzed articles have been analyzed
   useEffect(() => {
@@ -496,19 +525,31 @@ export default function ArticleList() {
     
     if (!hasUnanalyzedArticles || isLoading || isRefreshing || isPolling) return;
 
-    // Don't start polling immediately, wait for the initial fetch to complete
-    const timer = setTimeout(() => {
-      const pollInterval = setInterval(() => {
-        // Only fetch if we're not already in any loading state
-        if (!isLoading && !isRefreshing && !isPolling) {
-          fetchArticles(false, true); // Pass true to indicate this is a polling call
+    console.log('Starting to poll for article analysis updates...');
+    
+    // Poll immediately first, then set up interval
+    const pollForUpdates = async () => {
+      if (!isLoading && !isRefreshing && !isPolling) {
+        console.log('Polling for article analysis updates...');
+        try {
+          setIsPolling(true);
+          await fetchArticles(false, true);
+        } finally {
+          setIsPolling(false);
         }
-      }, 10000); // Poll every 10 seconds
+      }
+    };
 
-      return () => clearInterval(pollInterval);
-    }, 5000); // Start polling 5 seconds after the initial fetch
+    // Initial poll after a short delay
+    const initialPollTimer = setTimeout(pollForUpdates, 3000);
+    
+    // Set up interval for subsequent polls
+    const pollInterval = setInterval(pollForUpdates, 10000);
 
-    return () => clearTimeout(timer);
+    return () => {
+      clearTimeout(initialPollTimer);
+      clearInterval(pollInterval);
+    };
   }, [articles, isLoading, isRefreshing, isPolling, fetchArticles]);
 
   // Apply filters whenever they change or articles change
@@ -517,8 +558,8 @@ export default function ArticleList() {
 
     const filtered = articles.filter((article) => {
       // Only include articles that have been successfully analyzed
-      if (article.analyzed !== true) return false
-
+      if (article.analyzed !== true) return false;
+      
       // Skip articles that don't have metrics
       if (!article.metrics) return false
 

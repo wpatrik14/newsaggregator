@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server"
 import { fetchTopHeadlines } from "@/lib/news-api"
 import { listArticlesFromBlob } from "@/lib/blob-storage"
+import type { Article } from "@/types/article"
 
 export async function GET(request: Request) {
   try {
@@ -12,8 +13,8 @@ export async function GET(request: Request) {
     const refresh = searchParams.get("refresh") === "true"
     const includeUnanalyzed = searchParams.get("includeUnanalyzed") === "true"
 
-    let articles = []
-    let errors: string[] = []
+    let articles: Article[] = [];
+    let errors: string[] = [];
 
     // Verify OpenAI API key is available
     if (!process.env.OPENAI_API_KEY) {
@@ -36,19 +37,51 @@ export async function GET(request: Request) {
 
     // If no articles in Blob storage or refresh is requested, fetch from News API
     if (refresh || articles.length === 0) {
-      const result = await fetchTopHeadlines(country, category, pageSize, page)
+      // Pass only the expected parameters to fetchTopHeadlines
+      const result = await fetchTopHeadlines(country, category, pageSize);
+      
+      // Create a map of existing article URLs and IDs for faster lookup
+      const existingArticlesMap = new Map(
+        articles.map((article: Article) => [article.url.toLowerCase(), article])
+      );
       
       if (refresh) {
-        // When refreshing, keep existing articles and add new ones
-        const existingUrls = new Set(articles.map(article => article.url))
-        const newArticles = result.articles.filter(article => !existingUrls.has(article.url))
-        articles = [...articles, ...newArticles]
+        // When refreshing, only add new articles that don't already exist
+        const newArticles = result.articles.filter((article: Article) => {
+          const normalizedUrl = article.url.toLowerCase();
+          return !existingArticlesMap.has(normalizedUrl) && 
+                 !articles.some((a: Article) => a.title === article.title && a.source === article.source);
+        });
+        
+        // Add new articles to the beginning of the array
+        articles = [...newArticles, ...articles] as Article[];
       } else {
         // When no articles exist, use the fetched ones
-        articles = result.articles
+        articles = result.articles as Article[];
       }
       
-      errors = result.errors
+      // Ensure we don't have any duplicates by URL or title+source
+      const uniqueArticles: Article[] = [];
+      const seenUrls = new Set<string>();
+      const seenTitles = new Set<string>();
+      
+      for (const article of articles) {
+        const normalizedUrl = article.url.toLowerCase();
+        const titleSourceKey = `${article.title.toLowerCase()}-${article.source.toLowerCase()}`;
+        
+        if (!seenUrls.has(normalizedUrl) && !seenTitles.has(titleSourceKey)) {
+          seenUrls.add(normalizedUrl);
+          seenTitles.add(titleSourceKey);
+          uniqueArticles.push(article);
+        }
+      }
+      
+      // Apply pagination to the deduplicated articles
+      const startIndex = (page - 1) * pageSize;
+      articles = uniqueArticles.slice(startIndex, startIndex + pageSize);
+      
+      // Combine errors
+      errors = [...(errors || []), ...(result.errors || [])];
     }
 
     return NextResponse.json({ articles, errors })

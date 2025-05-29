@@ -284,36 +284,49 @@ export async function fetchTopHeadlines(
         }
 
         try {
+          const articleIdToCheck = article.article_id || article.link;
+          
           // Check if we already have this article in our storage using article_id
           if (typeof getArticleFromBlob === 'function') {
-            // First try to find by article_id if available
-            const articleIdToCheck = article.article_id || article.link;
             const existingArticle = await getArticleFromBlob(articleIdToCheck);
             if (existingArticle) {
               console.log(`Article already exists in storage: ${articleIdToCheck}`);
-              processedArticles.push(existingArticle);
+              // Only add to processed articles if it's not already there
+              if (!processedArticles.some(a => (a.id === existingArticle.id) || (a.url === existingArticle.url))) {
+                processedArticles.push(existingArticle);
+              }
               continue;
             }
           }
 
+          // Check if we've already processed an article with the same URL in this batch
+          const isDuplicateInBatch = processedArticles.some(a => 
+            a.url === newArticle.url || 
+            (a.title === newArticle.title && a.source === newArticle.source)
+          );
+          
+          if (isDuplicateInBatch) {
+            console.log(`Skipping duplicate article in batch: ${article.title}`);
+            continue;
+          }
+
           // Store the unanalyzed article first to prevent duplicates
-          await storeArticle(newArticle)
-          console.log(`Stored unanalyzed article: ${article.title}`)
+          await storeArticle(newArticle);
+          console.log(`Stored unanalyzed article: ${article.title}`);
 
           // Add to in-progress set to prevent duplicate analysis
-          const articleIdToCheck = article.article_id || article.link;
-          articlesInProgress.add(articleIdToCheck)
+          articlesInProgress.add(articleIdToCheck);
 
           // Start analysis in the background if we have content
           if (content) {
             analyzeArticleInBackground(newArticle, article.title, content)
               .catch((error) => {
-                console.error(`Error analyzing article: ${error}`)
-                errors.push(`Failed to analyze article: ${article.title}`)
-              })
+                console.error(`Error analyzing article: ${error}`);
+                errors.push(`Failed to analyze article: ${article.title}`);
+              });
           }
 
-          processedArticles.push(newArticle)
+          processedArticles.push(newArticle);
         } catch (storageError) {
           console.error("Error storing article:", storageError)
           errors.push(`Failed to store article: ${article.title}`)

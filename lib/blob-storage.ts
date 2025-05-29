@@ -5,6 +5,28 @@ const ARTICLES_PREFIX = "articles/"
 const MAX_AGE_MS = 60 * 60 * 1000 // 1 hour in milliseconds
 const RATE_LIMIT_DELAY = 500 // Delay between requests in ms to avoid rate limiting
 
+// Helper function to normalize URLs for comparison
+function normalizeUrl(url: string): string {
+  if (!url) return '';
+  try {
+    // Handle cases where URL might be a pathname
+    const baseUrl = url.startsWith('http') ? url : `https://example.com${url.startsWith('/') ? '' : '/'}${url}`;
+    const u = new URL(baseUrl);
+    // Remove protocol, www, query params, hash, and trailing slashes
+    let result = `${u.hostname.replace('www.', '')}${u.pathname}`
+      .replace(/\/+$/, '') // Remove trailing slashes
+      .toLowerCase();
+    
+    // Remove common tracking parameters that might be in the path
+    result = result.replace(/[?&]?(utm_|ref=|source=)[^&]+/g, '');
+    
+    return result;
+  } catch (e) {
+    console.error('Error normalizing URL:', url, e);
+    return url.toLowerCase();
+  }
+}
+
 // Helper function to add delay between requests
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
@@ -40,8 +62,7 @@ export async function storeArticle(article: Article): Promise<string> {
 
     const blob = await put(`${ARTICLES_PREFIX}${article.id}.json`, articleJson, {
       contentType: "application/json",
-      access: "public", // Set access to public as required by Vercel Blob
-      allowOverwrite: true, // Allow overwriting existing blobs with the same name
+      access: "public" // Set access to public as required by Vercel Blob
     })
 
     return blob.url
@@ -53,127 +74,122 @@ export async function storeArticle(article: Article): Promise<string> {
 }
 
 // Check if an article with the same URL already exists
-// This function now has more robust error handling
+// This function now has more robust error handling and duplicate detection
 async function checkDuplicateArticle(article: Article): Promise<string | null> {
-  try {
-    // List all blobs with the articles prefix
-    const { blobs } = await list({ prefix: ARTICLES_PREFIX, limit: 50 }) // Increased limit to check more articles
+  if (!article.url) {
+    console.warn('Article has no URL, cannot check for duplicates');
+    return null;
+  }
 
-    // If no blobs, no duplicates
-    if (blobs.length === 0) {
-      return null;
+  try {
+    // First, try to find by article ID if it exists
+    if (article.id) {
+      try {
+        const existingArticle = await getArticleFromBlob(article.id);
+        if (existingArticle) {
+          console.log(`Found existing article by ID: ${article.id}`);
+          return `id:${article.id}`;
+        }
+      } catch (error) {
+        console.error('Error checking article by ID:', error);
+      }
     }
 
-    // First, check if we can find a match by URL without fetching content
-    for (const blob of blobs) {
-      try {
-        // Extract ID from the path
-        const pathParts = blob.pathname.split("/");
-        const filename = pathParts[pathParts.length - 1];
-        const id = filename.replace(".json", "");
+    // Get the normalized URL for comparison
+    const normalizedUrl = normalizeUrl(article.url);
+    console.log(`Checking for duplicate of URL: ${normalizedUrl}`);
 
-        // Skip the current article if it's being updated
-        if (id === article.id) {
+    // List all blobs with the articles prefix
+    let cursor: string | undefined;
+    let duplicateUrl: string | null = null;
+
+    // Check multiple pages of blobs if needed
+    for (let i = 0; i < 5; i++) { // Check up to 5 pages (500 articles)
+      const { blobs, hasMore, cursor: nextCursor } = await list({ 
+        prefix: ARTICLES_PREFIX, 
+        limit: 100, 
+        cursor 
+      });
+
+      // If no blobs, no duplicates
+      if (!blobs.length) break;
+
+      // First, check if we can find a match by URL in the blob paths (fast check)
+      for (const blob of blobs) {
+        try {
+          // Skip if we've already found a duplicate
+          if (duplicateUrl) break;
+
+          // Extract ID from the path
+          const pathParts = blob.pathname.split("/");
+          const filename = pathParts[pathParts.length - 1];
+          const id = filename.replace(".json", "");
+
+          // Skip the current article if it's being updated
+          if (id === article.id) continue;
+
+          // If the URL is in the blob's path, it's likely a duplicate
+          const blobUrl = blob.pathname.split('/').pop()?.replace(/\.json$/, '');
+          if (blobUrl && normalizeUrl(blobUrl) === normalizedUrl) {
+            console.log(`Found duplicate article by URL in path: ${article.url}`);
+            duplicateUrl = blob.url;
+            break;
+          }
+        } catch (error) {
+          console.error("Error checking blob path:", error);
           continue;
         }
-
-        // If the URL is in the blob's path, it's likely a duplicate
-        if (blob.pathname.includes(encodeURIComponent(article.url))) {
-          return blob.url;
-        }
-      } catch (error) {
-        console.error("Error checking blob path:", error);
-        continue;
       }
-    }
 
-    // If no match found by path, check the content of a limited number of blobs
-    const blobsToCheck = blobs.slice(0, 10); // Check up to 10 most recent blobs
+      // If we found a duplicate in the fast check, return it
+      if (duplicateUrl) return duplicateUrl;
 
-    for (const blob of blobsToCheck) {
-      try {
-        // Add a small delay between requests to avoid rate limiting
-        await delay(RATE_LIMIT_DELAY);
+      // If no match found by path, check the content of these blobs
+      for (const blob of blobs) {
+        try {
+          // Skip if we've already found a duplicate
+          if (duplicateUrl) break;
 
-        // Use a timeout to prevent hanging requests
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 5000); // 5 second timeout
+          // Add a small delay between requests to avoid rate limiting
+          await delay(RATE_LIMIT_DELAY);
 
-        const response = await fetch(blob.url, {
-          signal: controller.signal,
-          // Add cache control to avoid caching issues
-          headers: {
-            "Cache-Control": "no-cache, no-store, must-revalidate",
-            Pragma: "no-cache",
-            Expires: "0",
-          },
-        })
+          const existingArticle = await getArticleFromBlob(blob.pathname.split('/').pop() || '');
+          if (!existingArticle) continue;
 
-        clearTimeout(timeoutId)
-
-        // Check for rate limiting or other errors
-        if (!response.ok) {
-          console.warn(`Received ${response.status} when fetching ${blob.url}`)
-
-          // If we're being rate limited, wait longer and skip this check
-          if (response.status === 429) {
-            console.warn("Rate limited by Blob storage API, skipping duplicate check");
-            return null; // Skip duplicate check rather than failing
+          // Check if URLs match (normalized)
+          if (existingArticle.url && normalizeUrl(existingArticle.url) === normalizedUrl) {
+            console.log(`Found duplicate article by URL: ${article.url}`);
+            duplicateUrl = blob.url;
+            break;
           }
 
-          continue; // Skip this blob and try the next one
-        }
-
-        const existingArticle: Article = await response.json();
-
-        // Check if the URLs match (case insensitive and ignoring URL parameters)
-        const normalizeUrl = (url: string) => {
-          try {
-            const u = new URL(url);
-            // Remove query parameters and hash, and normalize the URL
-            return `${u.protocol}//${u.hostname}${u.pathname}`
-              .replace(/\/$/, '') // Remove trailing slash
-              .toLowerCase();
-          } catch (e) {
-            return url.toLowerCase();
+          // Check if titles are similar (as a fallback)
+          if (existingArticle.title && article.title && 
+              similarTitles(existingArticle.title, article.title)) {
+            console.log(`Found similar article by title: ${article.title}`);
+            duplicateUrl = blob.url;
+            break;
           }
-        };
-
-        const normalizedNewUrl = normalizeUrl(article.url);
-        const normalizedExistingUrl = existingArticle.url ? normalizeUrl(existingArticle.url) : '';
-
-        if (normalizedNewUrl === normalizedExistingUrl) {
-          console.log(`Found duplicate article by URL: ${article.url}`);
-          return blob.url;
+        } catch (error) {
+          console.error('Error checking article content:', error);
+          continue;
         }
-
-        // Additional check for similar URLs with different protocols (http vs https)
-        if (normalizedNewUrl.replace(/^https?:/, '') === normalizedExistingUrl.replace(/^https?:/, '')) {
-          console.log(`Found duplicate article by URL (different protocols): ${article.url}`);
-          return blob.url;
-        }
-
-        // Also check if the titles are similar (as a fallback)
-        if (
-          existingArticle.title &&
-          article.title &&
-          similarTitles(existingArticle.title, article.title)
-        ) {
-          console.log(`Found similar article by title: ${article.title}`);
-          return blob.url;
-        }
-      } catch (error) {
-        // If fetch fails for a specific blob, log and continue with the next one
-        console.error(`Error checking article at ${blob.url}:`, error);
-        continue; // Skip this blob and try the next one
       }
+
+      // If we found a duplicate in the content check, return it
+      if (duplicateUrl) return duplicateUrl;
+
+      // If there are no more blobs to check, we're done
+      if (!hasMore || !nextCursor) break;
+      
+      // Otherwise, continue with the next page
+      cursor = nextCursor;
     }
 
     return null; // No duplicates found
   } catch (error) {
-    // If the overall process fails, log and rethrow
-    console.error("Error checking for duplicate articles:", error)
-    throw error // Rethrow to be handled by the caller
+    console.error('Error in checkDuplicateArticle:', error);
+    return null; // Don't block article saving if there's an error
   }
 }
 
