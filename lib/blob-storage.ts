@@ -5,47 +5,88 @@ const ARTICLES_PREFIX = "articles/"
 const MAX_AGE_MS = 60 * 60 * 1000 // 1 hour in milliseconds
 const RATE_LIMIT_DELAY = 500 // Delay between requests in ms to avoid rate limiting
 
+// In-memory cache to track articles being processed
+const articlesBeingProcessed = new Set<string>()
+const processedArticleUrls = new Set<string>()
+
 // Helper function to normalize URLs for comparison
 function normalizeUrl(url: string): string {
-  if (!url) return '';
+  if (!url) return ""
   try {
     // Handle cases where URL might be a pathname
-    const baseUrl = url.startsWith('http') ? url : `https://example.com${url.startsWith('/') ? '' : '/'}${url}`;
-    const u = new URL(baseUrl);
+    const baseUrl = url.startsWith("http") ? url : `https://example.com${url.startsWith("/") ? "" : "/"}${url}`
+    const u = new URL(baseUrl)
     // Remove protocol, www, query params, hash, and trailing slashes
-    let result = `${u.hostname.replace('www.', '')}${u.pathname}`
-      .replace(/\/+$/, '') // Remove trailing slashes
-      .toLowerCase();
-    
-    // Remove common tracking parameters that might be in the path
-    result = result.replace(/[?&]?(utm_|ref=|source=)[^&]+/g, '');
-    
-    return result;
+    let result = `${u.hostname.replace("www.", "")}${u.pathname}`
+      .replace(/\/+$/, "") // Remove trailing slashes
+      .toLowerCase()
+
+    // Remove common tracking parameters
+    result = result.replace(/[?&]?(utm_|ref=|source=)[^&]+/g, "")
+
+    return result
   } catch (e) {
-    console.error('Error normalizing URL:', url, e);
-    return url.toLowerCase();
+    console.error("Error normalizing URL:", url, e)
+    return url.toLowerCase()
   }
 }
 
 // Helper function to add delay between requests
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
+// Check if article is already being processed
+export function isArticleBeingProcessed(articleId: string): boolean {
+  return articlesBeingProcessed.has(articleId)
+}
+
+// Mark article as being processed
+export function markArticleAsProcessing(articleId: string): void {
+  articlesBeingProcessed.add(articleId)
+}
+
+// Mark article as finished processing
+export function markArticleAsFinished(articleId: string): void {
+  articlesBeingProcessed.delete(articleId)
+}
+
 // Store an article in Blob storage
 export async function storeArticle(article: Article): Promise<string> {
   try {
-    // Skip duplicate check if the article is being updated (already analyzed)
-    // Only check for duplicates for new articles
+    // Check if this article is already being processed
+    if (isArticleBeingProcessed(article.id)) {
+      console.log(`Article ${article.id} is already being processed, skipping`)
+      return `processing:${article.id}`
+    }
+
+    // Check if we've already processed this URL
+    if (article.url) {
+      const normalizedUrl = normalizeUrl(article.url)
+      if (processedArticleUrls.has(normalizedUrl)) {
+        console.log(`Article with URL ${article.url} already processed, skipping`)
+        return `duplicate:${article.id}`
+      }
+
+      // Mark URL as processed
+      processedArticleUrls.add(normalizedUrl)
+    }
+
+    // Mark as being processed if it's unanalyzed
+    if (!article.analyzed) {
+      markArticleAsProcessing(article.id)
+    }
+
+    // Check for duplicates only for new articles
     if (!article.analyzed) {
       try {
         const isDuplicate = await checkDuplicateArticle(article)
         if (isDuplicate) {
           console.log(`Article with URL ${article.url} already exists, skipping storage`)
-          return isDuplicate // Return the existing URL
+          markArticleAsFinished(article.id)
+          return isDuplicate
         }
       } catch (duplicateError) {
-        // Log the error but continue with storing the article
         console.error("Error checking for duplicate article:", duplicateError)
-        // Don't return here, continue with storing the article
+        // Continue with storing the article
       }
     }
 
@@ -62,140 +103,84 @@ export async function storeArticle(article: Article): Promise<string> {
 
     const blob = await put(`${ARTICLES_PREFIX}${article.id}.json`, articleJson, {
       contentType: "application/json",
-      access: "public" // Set access to public as required by Vercel Blob
+      access: "public",
+      allowOverwrite: true, // Allow overwriting for analysis updates
     })
+
+    // Mark as finished processing when analysis is complete
+    if (article.analyzed) {
+      markArticleAsFinished(article.id)
+    }
 
     return blob.url
   } catch (error) {
     console.error(`Error storing article ${article.id} in Blob storage:`, error)
-    // Return a dummy URL to allow the application to continue
+    markArticleAsFinished(article.id)
     return `error:${article.id}`
   }
 }
 
 // Check if an article with the same URL already exists
-// This function now has more robust error handling and duplicate detection
 async function checkDuplicateArticle(article: Article): Promise<string | null> {
   if (!article.url) {
-    console.warn('Article has no URL, cannot check for duplicates');
-    return null;
+    console.warn("Article has no URL, cannot check for duplicates")
+    return null
   }
 
   try {
-    // First, try to find by article ID if it exists
-    if (article.id) {
+    // Get the normalized URL for comparison
+    const normalizedUrl = normalizeUrl(article.url)
+
+    // List recent blobs to check for duplicates
+    const { blobs } = await list({
+      prefix: ARTICLES_PREFIX,
+      limit: 100, // Check last 100 articles
+    })
+
+    // Check each blob for URL matches
+    for (const blob of blobs) {
       try {
-        const existingArticle = await getArticleFromBlob(article.id);
-        if (existingArticle) {
-          console.log(`Found existing article by ID: ${article.id}`);
-          return `id:${article.id}`;
+        // Extract ID from the path
+        const pathParts = blob.pathname.split("/")
+        const filename = pathParts[pathParts.length - 1]
+        const id = filename.replace(".json", "")
+
+        // Skip the current article if it's being updated
+        if (id === article.id) continue
+
+        // Add a small delay between requests
+        await delay(RATE_LIMIT_DELAY)
+
+        // Try to get the article, but don't throw if it doesn't exist
+        const existingArticle = await getArticleFromBlobSafe(id)
+        if (!existingArticle) continue
+
+        // Check if URLs match (normalized)
+        if (existingArticle.url && normalizeUrl(existingArticle.url) === normalizedUrl) {
+          console.log(`Found duplicate article by URL: ${article.url}`)
+          return blob.url
+        }
+
+        // Check if titles are very similar and from same source
+        if (existingArticle.source === article.source && similarTitles(existingArticle.title, article.title)) {
+          console.log(`Found similar article by title: ${article.title}`)
+          return blob.url
         }
       } catch (error) {
-        console.error('Error checking article by ID:', error);
+        console.error("Error checking article content:", error)
+        continue
       }
     }
 
-    // Get the normalized URL for comparison
-    const normalizedUrl = normalizeUrl(article.url);
-    console.log(`Checking for duplicate of URL: ${normalizedUrl}`);
-
-    // List all blobs with the articles prefix
-    let cursor: string | undefined;
-    let duplicateUrl: string | null = null;
-
-    // Check multiple pages of blobs if needed
-    for (let i = 0; i < 5; i++) { // Check up to 5 pages (500 articles)
-      const { blobs, hasMore, cursor: nextCursor } = await list({ 
-        prefix: ARTICLES_PREFIX, 
-        limit: 100, 
-        cursor 
-      });
-
-      // If no blobs, no duplicates
-      if (!blobs.length) break;
-
-      // First, check if we can find a match by URL in the blob paths (fast check)
-      for (const blob of blobs) {
-        try {
-          // Skip if we've already found a duplicate
-          if (duplicateUrl) break;
-
-          // Extract ID from the path
-          const pathParts = blob.pathname.split("/");
-          const filename = pathParts[pathParts.length - 1];
-          const id = filename.replace(".json", "");
-
-          // Skip the current article if it's being updated
-          if (id === article.id) continue;
-
-          // If the URL is in the blob's path, it's likely a duplicate
-          const blobUrl = blob.pathname.split('/').pop()?.replace(/\.json$/, '');
-          if (blobUrl && normalizeUrl(blobUrl) === normalizedUrl) {
-            console.log(`Found duplicate article by URL in path: ${article.url}`);
-            duplicateUrl = blob.url;
-            break;
-          }
-        } catch (error) {
-          console.error("Error checking blob path:", error);
-          continue;
-        }
-      }
-
-      // If we found a duplicate in the fast check, return it
-      if (duplicateUrl) return duplicateUrl;
-
-      // If no match found by path, check the content of these blobs
-      for (const blob of blobs) {
-        try {
-          // Skip if we've already found a duplicate
-          if (duplicateUrl) break;
-
-          // Add a small delay between requests to avoid rate limiting
-          await delay(RATE_LIMIT_DELAY);
-
-          const existingArticle = await getArticleFromBlob(blob.pathname.split('/').pop() || '');
-          if (!existingArticle) continue;
-
-          // Check if URLs match (normalized)
-          if (existingArticle.url && normalizeUrl(existingArticle.url) === normalizedUrl) {
-            console.log(`Found duplicate article by URL: ${article.url}`);
-            duplicateUrl = blob.url;
-            break;
-          }
-
-          // Check if titles are similar (as a fallback)
-          if (existingArticle.title && article.title && 
-              similarTitles(existingArticle.title, article.title)) {
-            console.log(`Found similar article by title: ${article.title}`);
-            duplicateUrl = blob.url;
-            break;
-          }
-        } catch (error) {
-          console.error('Error checking article content:', error);
-          continue;
-        }
-      }
-
-      // If we found a duplicate in the content check, return it
-      if (duplicateUrl) return duplicateUrl;
-
-      // If there are no more blobs to check, we're done
-      if (!hasMore || !nextCursor) break;
-      
-      // Otherwise, continue with the next page
-      cursor = nextCursor;
-    }
-
-    return null; // No duplicates found
+    return null
   } catch (error) {
-    console.error('Error in checkDuplicateArticle:', error);
-    return null; // Don't block article saving if there's an error
+    console.error("Error in checkDuplicateArticle:", error)
+    return null
   }
 }
 
 // Helper function to check if titles are similar
 function similarTitles(title1: string, title2: string): boolean {
-  // Normalize titles: lowercase and remove punctuation
   const normalize = (str: string) =>
     str
       .toLowerCase()
@@ -205,10 +190,8 @@ function similarTitles(title1: string, title2: string): boolean {
   const normalizedTitle1 = normalize(title1)
   const normalizedTitle2 = normalize(title2)
 
-  // If titles are identical after normalization
   if (normalizedTitle1 === normalizedTitle2) return true
 
-  // Check if one title is contained within the other
   if (normalizedTitle1.includes(normalizedTitle2) || normalizedTitle2.includes(normalizedTitle1)) {
     return true
   }
@@ -218,65 +201,90 @@ function similarTitles(title1: string, title2: string): boolean {
 
 // Store multiple articles in Blob storage
 export async function storeArticles(articles: Article[]): Promise<void> {
-  // Process articles sequentially to avoid rate limiting
   for (const article of articles) {
     await storeArticle(article)
-    // Add a delay between storing articles
     await delay(RATE_LIMIT_DELAY)
+  }
+}
+
+// Safe version of getArticleFromBlob that doesn't throw on 404
+async function getArticleFromBlobSafe(id: string): Promise<Article | null> {
+  try {
+    return await getArticleFromBlob(id)
+  } catch (error) {
+    console.log(
+      `Article ${id} not found or error fetching: ${error instanceof Error ? error.message : "Unknown error"}`,
+    )
+    return null
   }
 }
 
 // Get an article from Blob storage by ID
 export async function getArticleFromBlob(id: string): Promise<Article | null> {
   try {
-    // List blobs with a specific prefix to find our article
+    // Handle invalid IDs
+    if (!id || id === "undefined" || id === "null") {
+      console.warn(`Invalid article ID: ${id}`)
+      return null
+    }
+
     const { blobs } = await list({ prefix: `${ARTICLES_PREFIX}${id}.json` })
 
     if (!blobs.length) {
       return null
     }
 
-    // Get the article blob
     const blob = blobs[0]
-
-    // Use a timeout to prevent hanging requests
     const controller = new AbortController()
-    const timeoutId = setTimeout(() => controller.abort(), 5000) // 5 second timeout
-
-    // Fetch the content from the URL
-    const response = await fetch(blob.url, {
-      signal: controller.signal,
-      // Add cache control to avoid caching issues
-      headers: {
-        "Cache-Control": "no-cache, no-store, must-revalidate",
-        Pragma: "no-cache",
-        Expires: "0",
-      },
-    })
-
-    clearTimeout(timeoutId)
-
-    if (!response.ok) {
-      throw new Error(`Failed to fetch article: ${response.status}`)
-    }
-
-    const articleJson = await response.text()
+    const timeoutId = setTimeout(() => controller.abort(), 5000)
 
     try {
-      const article = JSON.parse(articleJson) as Article
+      const response = await fetch(blob.url, {
+        signal: controller.signal,
+        headers: {
+          "Cache-Control": "no-cache, no-store, must-revalidate",
+          Pragma: "no-cache",
+          Expires: "0",
+        },
+      })
 
-      // Ensure the article has the analyzed flag
-      if (article.metrics && !article.analyzed) {
-        article.analyzed = true
+      clearTimeout(timeoutId)
+
+      // Handle 404 gracefully
+      if (response.status === 404) {
+        console.log(`Article ${id} not found (404)`)
+        return null
       }
 
-      return article
-    } catch (parseError) {
-      console.error(`Invalid JSON for article ${id}: ${articleJson.substring(0, 50)}...`)
+      if (!response.ok) {
+        throw new Error(`Failed to fetch article: ${response.status}`)
+      }
+
+      const articleJson = await response.text()
+
+      try {
+        const article = JSON.parse(articleJson) as Article
+
+        if (article.metrics && !article.analyzed) {
+          article.analyzed = true
+        }
+
+        return article
+      } catch (parseError) {
+        console.error(`Invalid JSON for article ${id}: ${articleJson.substring(0, 50)}...`)
+        return null
+      }
+    } catch (fetchError) {
+      // Handle fetch errors (like timeout, network issues)
+      if (fetchError.name === "AbortError") {
+        console.error(`Timeout fetching article ${id}`)
+      } else {
+        console.error(`Error fetching article ${id}: ${fetchError.message}`)
+      }
       return null
     }
   } catch (error) {
-    console.error(`Error fetching article ${id} from Blob storage:`, error)
+    console.error(`Error getting article ${id} from Blob storage:`, error)
     return null
   }
 }
@@ -290,54 +298,64 @@ export async function listArticlesFromBlob(): Promise<Article[]> {
       return []
     }
 
-    // Limit the number of blobs we process to avoid rate limiting
-    const blobsToProcess = blobs.slice(0, 50) // Only process the most recent 50 articles
+    const blobsToProcess = blobs.slice(0, 50)
     const articles: Article[] = []
 
-    // Process blobs sequentially to avoid rate limiting
     for (const blob of blobsToProcess) {
       try {
-        // Add a small delay between requests
         await delay(RATE_LIMIT_DELAY)
 
-        // Use a timeout to prevent hanging requests
         const controller = new AbortController()
-        const timeoutId = setTimeout(() => controller.abort(), 5000) // 5 second timeout
-
-        const response = await fetch(blob.url, {
-          signal: controller.signal,
-          // Add cache control to avoid caching issues
-          headers: {
-            "Cache-Control": "no-cache, no-store, must-revalidate",
-            Pragma: "no-cache",
-            Expires: "0",
-          },
-        })
-
-        clearTimeout(timeoutId)
-
-        if (!response.ok) {
-          console.warn(`Received ${response.status} when fetching ${blob.url}`)
-          continue
-        }
-
-        const articleJson = await response.text()
+        const timeoutId = setTimeout(() => controller.abort(), 5000)
 
         try {
-          const article = JSON.parse(articleJson) as Article
+          const response = await fetch(blob.url, {
+            signal: controller.signal,
+            headers: {
+              "Cache-Control": "no-cache, no-store, must-revalidate",
+              Pragma: "no-cache",
+              Expires: "0",
+            },
+          })
 
-          // Ensure the article has the analyzed flag
-          if (article.metrics && !article.analyzed) {
-            article.analyzed = true
+          clearTimeout(timeoutId)
+
+          // Skip if 404
+          if (response.status === 404) {
+            console.log(`Article at ${blob.url} not found (404), skipping`)
+            continue
           }
 
-          articles.push(article)
-        } catch (parseError) {
-          console.error(`Invalid JSON from ${blob.url}: ${articleJson.substring(0, 50)}...`)
+          if (!response.ok) {
+            console.warn(`Received ${response.status} when fetching ${blob.url}, skipping`)
+            continue
+          }
+
+          const articleJson = await response.text()
+
+          try {
+            const article = JSON.parse(articleJson) as Article
+
+            if (article.metrics && !article.analyzed) {
+              article.analyzed = true
+            }
+
+            articles.push(article)
+          } catch (parseError) {
+            console.error(`Invalid JSON from ${blob.url}: ${articleJson.substring(0, 50)}...`)
+            continue
+          }
+        } catch (fetchError) {
+          // Handle fetch errors (like timeout, network issues)
+          if (fetchError.name === "AbortError") {
+            console.error(`Timeout fetching article at ${blob.url}`)
+          } else {
+            console.error(`Error fetching article at ${blob.url}: ${fetchError.message}`)
+          }
           continue
         }
       } catch (error) {
-        console.error(`Error fetching article from ${blob.url}:`, error)
+        console.error(`Error processing blob at ${blob.url}:`, error)
         continue
       }
     }
@@ -353,8 +371,43 @@ export async function listArticlesFromBlob(): Promise<Article[]> {
 export async function deleteArticleFromBlob(id: string): Promise<void> {
   try {
     await del(`${ARTICLES_PREFIX}${id}.json`)
+    // Also remove from processing tracking
+    markArticleAsFinished(id)
   } catch (error) {
     console.error(`Error deleting article ${id} from Blob storage:`, error)
+  }
+}
+
+// Delete all articles from Blob storage
+export async function deleteAllArticlesFromBlob(): Promise<number> {
+  try {
+    const { blobs } = await list({ prefix: ARTICLES_PREFIX })
+    let deletedCount = 0
+
+    for (const blob of blobs) {
+      try {
+        const pathParts = blob.pathname.split("/")
+        const filename = pathParts[pathParts.length - 1]
+        const id = filename.replace(".json", "")
+
+        await deleteArticleFromBlob(id)
+        deletedCount++
+        await delay(RATE_LIMIT_DELAY)
+      } catch (error) {
+        console.error(`Error deleting blob at ${blob.url}:`, error)
+        continue
+      }
+    }
+
+    // Clear all tracking sets
+    articlesBeingProcessed.clear()
+    processedArticleUrls.clear()
+
+    console.log(`Deleted ${deletedCount} articles`)
+    return deletedCount
+  } catch (error) {
+    console.error("Error deleting all articles:", error)
+    return 0
   }
 }
 
@@ -365,60 +418,68 @@ export async function cleanupOldArticles(): Promise<number> {
     const now = new Date()
     let deletedCount = 0
 
-    // Process blobs sequentially to avoid rate limiting
     for (const blob of blobs) {
       try {
-        // Add a small delay between requests
         await delay(RATE_LIMIT_DELAY)
 
-        // Use a timeout to prevent hanging requests
         const controller = new AbortController()
-        const timeoutId = setTimeout(() => controller.abort(), 5000) // 5 second timeout
-
-        const response = await fetch(blob.url, {
-          signal: controller.signal,
-          // Add cache control to avoid caching issues
-          headers: {
-            "Cache-Control": "no-cache, no-store, must-revalidate",
-            Pragma: "no-cache",
-            Expires: "0",
-          },
-        })
-
-        clearTimeout(timeoutId)
-
-        if (!response.ok) {
-          console.warn(`Received ${response.status} when fetching ${blob.url}`)
-          continue
-        }
-
-        const articleJson = await response.text()
-        let article: Article & { storedAt?: string }
+        const timeoutId = setTimeout(() => controller.abort(), 5000)
 
         try {
-          article = JSON.parse(articleJson) as Article & { storedAt?: string }
-        } catch (parseError) {
-          console.error(`Invalid JSON from ${blob.url}: ${articleJson.substring(0, 50)}...`)
+          const response = await fetch(blob.url, {
+            signal: controller.signal,
+            headers: {
+              "Cache-Control": "no-cache, no-store, must-revalidate",
+              Pragma: "no-cache",
+              Expires: "0",
+            },
+          })
+
+          clearTimeout(timeoutId)
+
+          // Skip if 404
+          if (response.status === 404) {
+            console.log(`Article at ${blob.url} not found (404), skipping`)
+            continue
+          }
+
+          if (!response.ok) {
+            console.warn(`Received ${response.status} when fetching ${blob.url}, skipping`)
+            continue
+          }
+
+          const articleJson = await response.text()
+          let article: Article & { storedAt?: string }
+
+          try {
+            article = JSON.parse(articleJson) as Article & { storedAt?: string }
+          } catch (parseError) {
+            console.error(`Invalid JSON from ${blob.url}: ${articleJson.substring(0, 50)}...`)
+            continue
+          }
+
+          if (!article.storedAt) continue
+
+          const storedAt = new Date(article.storedAt)
+          const ageMs = now.getTime() - storedAt.getTime()
+
+          if (ageMs > MAX_AGE_MS) {
+            const pathParts = blob.pathname.split("/")
+            const filename = pathParts[pathParts.length - 1]
+            const id = filename.replace(".json", "")
+
+            await delay(RATE_LIMIT_DELAY)
+            await deleteArticleFromBlob(id)
+            deletedCount++
+          }
+        } catch (fetchError) {
+          // Handle fetch errors (like timeout, network issues)
+          if (fetchError.name === "AbortError") {
+            console.error(`Timeout fetching article at ${blob.url}`)
+          } else {
+            console.error(`Error fetching article at ${blob.url}: ${fetchError.message}`)
+          }
           continue
-        }
-
-        // If article has no timestamp or is older than MAX_AGE_MS, delete it
-        if (!article.storedAt) continue
-
-        const storedAt = new Date(article.storedAt)
-        const ageMs = now.getTime() - storedAt.getTime()
-
-        if (ageMs > MAX_AGE_MS) {
-          // Extract ID from the path
-          const pathParts = blob.pathname.split("/")
-          const filename = pathParts[pathParts.length - 1]
-          const id = filename.replace(".json", "")
-
-          // Add a small delay before deleting
-          await delay(RATE_LIMIT_DELAY)
-
-          await deleteArticleFromBlob(id)
-          deletedCount++
         }
       } catch (error) {
         console.error(`Error processing blob at ${blob.url}:`, error)

@@ -11,12 +11,11 @@ export async function GET(request: Request) {
     const page = Number.parseInt(searchParams.get("page") || "1", 10)
     const pageSize = Number.parseInt(searchParams.get("pageSize") || "5", 10)
     const refresh = searchParams.get("refresh") === "true"
-    const includeUnanalyzed = searchParams.get("includeUnanalyzed") === "true"
 
-    let articles: Article[] = [];
-    let errors: string[] = [];
+    let articles: Article[] = []
+    let errors: string[] = []
 
-    // Verify OpenAI API key is available
+    // Verify API keys are available
     if (!process.env.OPENAI_API_KEY) {
       return NextResponse.json(
         { error: "OpenAI API key is missing. Please add OPENAI_API_KEY to your environment variables." },
@@ -24,67 +23,87 @@ export async function GET(request: Request) {
       )
     }
 
+    if (!process.env.NEWS_ORG_API_KEY) {
+      return NextResponse.json(
+        { error: "NewsAPI.org API key is missing. Please add NEWS_ORG_API_KEY to your environment variables." },
+        { status: 500 },
+      )
+    }
+
     // Always try to get articles from Blob storage first
     const storedArticles = await listArticlesFromBlob()
 
-    // Filter articles based on includeUnanalyzed parameter
-    if (includeUnanalyzed) {
-      articles = storedArticles // Include all articles
-    } else {
-      // Only return articles that have been analyzed
-      articles = storedArticles.filter((article) => article.analyzed === true)
-    }
+    // Only return articles that have been analyzed
+    const analyzedStoredArticles = storedArticles.filter((article) => article.analyzed === true)
 
-    // If no articles in Blob storage or refresh is requested, fetch from News API
-    if (refresh || articles.length === 0) {
-      // Pass only the expected parameters to fetchTopHeadlines
-      const result = await fetchTopHeadlines(country, category, pageSize);
-      
-      // Create a map of existing article URLs and IDs for faster lookup
-      const existingArticlesMap = new Map(
-        articles.map((article: Article) => [article.url.toLowerCase(), article])
-      );
-      
-      if (refresh) {
-        // When refreshing, only add new articles that don't already exist
+    // Only fetch new articles if:
+    // 1. Refresh is explicitly requested, OR
+    // 2. No analyzed articles exist in storage at all
+    const shouldFetchNew = refresh || analyzedStoredArticles.length === 0
+
+    if (shouldFetchNew) {
+      console.log(
+        `Fetching new articles: refresh=${refresh}, existing analyzed articles=${analyzedStoredArticles.length}`,
+      )
+
+      const result = await fetchTopHeadlines(country, category, pageSize)
+
+      if (refresh && analyzedStoredArticles.length > 0) {
+        // When refreshing with existing articles, only add truly new ones
+        const existingUrls = new Set(analyzedStoredArticles.map((a) => a.url.toLowerCase()))
+        const existingTitles = new Set(
+          analyzedStoredArticles.map((a) => `${a.title.toLowerCase()}-${a.source.toLowerCase()}`),
+        )
+
         const newArticles = result.articles.filter((article: Article) => {
-          const normalizedUrl = article.url.toLowerCase();
-          return !existingArticlesMap.has(normalizedUrl) && 
-                 !articles.some((a: Article) => a.title === article.title && a.source === article.source);
-        });
-        
+          const normalizedUrl = article.url.toLowerCase()
+          const titleSourceKey = `${article.title.toLowerCase()}-${article.source.toLowerCase()}`
+
+          return !existingUrls.has(normalizedUrl) && !existingTitles.has(titleSourceKey)
+        })
+
+        console.log(`Found ${newArticles.length} new analyzed articles out of ${result.articles.length} fetched`)
+
         // Add new articles to the beginning of the array
-        articles = [...newArticles, ...articles] as Article[];
+        articles = [...newArticles, ...analyzedStoredArticles]
       } else {
-        // When no articles exist, use the fetched ones
-        articles = result.articles as Article[];
+        // When no articles exist, use the fetched ones (all should be analyzed)
+        articles = result.articles as Article[]
       }
-      
-      // Ensure we don't have any duplicates by URL or title+source
-      const uniqueArticles: Article[] = [];
-      const seenUrls = new Set<string>();
-      const seenTitles = new Set<string>();
-      
-      for (const article of articles) {
-        const normalizedUrl = article.url.toLowerCase();
-        const titleSourceKey = `${article.title.toLowerCase()}-${article.source.toLowerCase()}`;
-        
-        if (!seenUrls.has(normalizedUrl) && !seenTitles.has(titleSourceKey)) {
-          seenUrls.add(normalizedUrl);
-          seenTitles.add(titleSourceKey);
-          uniqueArticles.push(article);
-        }
-      }
-      
-      // Apply pagination to the deduplicated articles
-      const startIndex = (page - 1) * pageSize;
-      articles = uniqueArticles.slice(startIndex, startIndex + pageSize);
-      
+
       // Combine errors
-      errors = [...(errors || []), ...(result.errors || [])];
+      errors = [...(errors || []), ...(result.errors || [])]
+    } else {
+      console.log(`Using existing ${analyzedStoredArticles.length} analyzed articles from storage`)
+      articles = analyzedStoredArticles
     }
 
-    return NextResponse.json({ articles, errors })
+    // Remove duplicates by URL and title+source combination
+    const uniqueArticles: Article[] = []
+    const seenUrls = new Set<string>()
+    const seenTitles = new Set<string>()
+
+    for (const article of articles) {
+      const normalizedUrl = article.url.toLowerCase()
+      const titleSourceKey = `${article.title.toLowerCase()}-${article.source.toLowerCase()}`
+
+      if (!seenUrls.has(normalizedUrl) && !seenTitles.has(titleSourceKey)) {
+        seenUrls.add(normalizedUrl)
+        seenTitles.add(titleSourceKey)
+        uniqueArticles.push(article)
+      }
+    }
+
+    // Apply pagination to the deduplicated articles
+    const startIndex = (page - 1) * pageSize
+    const paginatedArticles = uniqueArticles.slice(startIndex, startIndex + pageSize)
+
+    return NextResponse.json({
+      articles: paginatedArticles,
+      errors,
+      totalArticles: uniqueArticles.length,
+      hasMore: startIndex + pageSize < uniqueArticles.length,
+    })
   } catch (error) {
     console.error("Error fetching articles:", error)
     return NextResponse.json(

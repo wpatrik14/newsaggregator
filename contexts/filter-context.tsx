@@ -23,7 +23,7 @@ const defaultFilters: FilterState = {
   targetGeneration: "all",
   source: "all",
   category: "all",
-  country: "hu"
+  country: "us", // Changed from "hu" to "us" for NewsAPI.org
 }
 
 const FilterContext = createContext<FilterContextType | undefined>(undefined)

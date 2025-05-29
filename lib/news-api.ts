@@ -1,34 +1,33 @@
 import type { Article } from "@/types/article"
 import { v4 as uuidv4 } from "uuid"
 import { analyzeArticle } from "./ai"
-import { storeArticle, getArticleFromBlob } from "./blob-storage"
-import { ArticleCategory } from "@/types/article"
+import { storeArticle, getArticleFromBlob, isArticleBeingProcessed } from "./blob-storage"
+import type { ArticleCategory } from "@/types/article"
 
-// NewsData.io API endpoints
-const NEWS_DATA_URL = "https://newsdata.io/api/1/news"
+// NewsAPI.org endpoints
+const NEWS_API_BASE_URL = "https://newsapi.org/v2"
+const TOP_HEADLINES_URL = `${NEWS_API_BASE_URL}/top-headlines`
+const EVERYTHING_URL = `${NEWS_API_BASE_URL}/everything`
 
-// NewsData.io response types
-interface NewsDataArticle {
-  article_id: string
+// NewsAPI.org response types
+interface NewsApiArticle {
+  source: {
+    id: string | null
+    name: string
+  }
+  author: string | null
   title: string
-  link: string
-  description: string
+  description: string | null
+  url: string
+  urlToImage: string | null
+  publishedAt: string
   content: string | null
-  pubDate: string
-  image_url: string | null
-  source_id: string
-  source_priority: number
-  country: string[]
-  category: string[]
-  language: string
-  creator: string[] | null
 }
 
-interface NewsDataResponse {
+interface NewsApiResponse {
   status: string
   totalResults: number
-  results: NewsDataArticle[]
-  nextPage?: number
+  articles: NewsApiArticle[]
   code?: string
   message?: string
 }
@@ -36,134 +35,117 @@ interface NewsDataResponse {
 // Helper function to add delay between requests
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
-// Track the current page for pagination
-let currentPage = 1
-
 // Track articles being analyzed to prevent duplicates
-const articlesInProgress = new Set<string>()
+const articlesInAnalysis = new Set<string>()
 
-// Search for articles using NewsData.io API
+// Search for articles using NewsAPI.org
 export async function searchArticles(
   query: string,
   from?: string,
   to?: string,
   sortBy: "relevancy" | "popularity" | "publishedAt" = "publishedAt",
-  size: number = 20
+  size = 20,
 ): Promise<{ articles: Article[]; errors: string[] }> {
   try {
     console.log(`Searching articles: query=${query}, from=${from}, to=${to}, sortBy=${sortBy}, size=${size}`)
 
-    const apiKey = process.env.NEWSDATA_API_KEY
+    const apiKey = process.env.NEWS_ORG_API_KEY
 
     if (!apiKey) {
-      throw new Error("NewsData.io API key is missing. Please add NEWSDATA_API_KEY to your environment variables.")
+      throw new Error("NewsAPI.org API key is missing. Please add NEWS_ORG_API_KEY to your environment variables.")
     }
 
-    // Build the URL with query parameters
-    const url = new URL(NEWS_DATA_URL)
-    url.searchParams.append("apikey", apiKey)
+    const url = new URL(EVERYTHING_URL)
+    url.searchParams.append("apiKey", apiKey)
     url.searchParams.append("q", query)
-    
-    if (from) url.searchParams.append("from_date", from)
-    if (to) url.searchParams.append("to_date", to)
-    
-    // Map sortBy to NewsData.io's format
+
+    if (from) url.searchParams.append("from", from)
+    if (to) url.searchParams.append("to", to)
+
     const sortMap = {
       relevancy: "relevancy",
       popularity: "popularity",
-      publishedAt: "published_desc"
+      publishedAt: "publishedAt",
     }
-    url.searchParams.append("sort", sortMap[sortBy] || "published_desc")
-    
-    url.searchParams.append("size", size.toString())
-    url.searchParams.append("language", "hu") // Limit to Hungarian articles
-    
-    console.log(`Making search request to NewsData.io: ${url.toString()}`)
-    
+    url.searchParams.append("sortBy", sortMap[sortBy] || "publishedAt")
+
+    url.searchParams.append("pageSize", size.toString())
+    url.searchParams.append("language", "en") // NewsAPI.org uses 'en' for English
+
+    console.log(`Making search request to NewsAPI.org: ${url.toString()}`)
+
     const response = await fetch(url.toString())
 
     if (!response.ok) {
       const errorData = await response.json().catch(() => ({}))
-      throw new Error(`NewsData.io error: ${errorData.message || response.statusText}`)
+      throw new Error(`NewsAPI.org error: ${errorData.message || response.statusText}`)
     }
 
-    const data: NewsDataResponse = await response.json()
-    console.log(`Received ${data.results?.length || 0} articles from NewsData.io search`)
+    const data: NewsApiResponse = await response.json()
+    console.log(`Received ${data.articles?.length || 0} articles from NewsAPI.org search`)
 
-    if (data.status !== "success") {
-      throw new Error(`NewsData.io error: ${data.message || 'Unknown error'}`)
+    if (data.status !== "ok") {
+      throw new Error(`NewsAPI.org error: ${data.message || "Unknown error"}`)
     }
 
-    // Process articles
+    // Only return analyzed articles for search
     const processedArticles: Article[] = []
     const errors: string[] = []
 
-    for (const apiArticle of data.results || []) {
+    for (const apiArticle of data.articles || []) {
       try {
-        // Skip if we've already processed this article
-        const articleKey = `${apiArticle.source_id}-${apiArticle.article_id}`
-        if (articlesInProgress.has(articleKey)) {
+        const articleKey = apiArticle.url
+
+        // Skip if already being processed
+        if (isArticleBeingProcessed(articleKey) || articlesInAnalysis.has(articleKey)) {
           console.log(`Skipping article already being processed: ${articleKey}`)
           continue
         }
 
-        articlesInProgress.add(articleKey)
-
-        const article: Article = {
-          id: apiArticle.article_id || uuidv4(),
-          title: apiArticle.title,
-          summary: apiArticle.description || '',
-          content: apiArticle.content || apiArticle.description || '',
-          url: apiArticle.link,
-          imageUrl: apiArticle.image_url || '',
-          source: apiArticle.source_id || 'Unknown',
-          publishedAt: apiArticle.pubDate,
-          metrics: {
-            clickbaitScore: 0,
-            biasScore: 0,
-            targetGeneration: '',
-            politicalLeaning: '',
-            sentimentScore: 0,
-            sentimentTone: 'neutral',
-            readabilityScore: 0,
-            readingLevel: '',
-            emotionalTone: 'neutral',
-            engagementScore: 0,
-            bias: 0,
-          },
-          analyzed: false,
-          storedAt: new Date().toISOString(),
-          categories: (apiArticle.category?.length 
-            ? apiArticle.category
-                .map(c => {
-                  const lowerCased = c.toLowerCase();
-                  // Only include categories that match our ArticleCategory type
-                  if ([
-                    'sport', 'economy', 'politics', 'war', 'technology', 'religion', 
-                    'work', 'travel', 'health', 'entertainment', 'science', 'education', 
-                    'environment', 'fashion', 'food', 'lifestyle', 'other'
-                  ].includes(lowerCased)) {
-                    return lowerCased as ArticleCategory;
-                  }
-                  return 'other';
-                })
-                .filter((cat, index, arr) => arr.indexOf(cat) === index) // Remove duplicates
-                .slice(0, 3) // Limit to 3 categories
-            : ['other']
-          ) as ArticleCategory[]
+        // For search, we'll analyze immediately and only return analyzed articles
+        const content = apiArticle.content || apiArticle.description || ""
+        if (!content) {
+          console.log(`Skipping article with no content: ${apiArticle.title}`)
+          continue
         }
 
+        try {
+          articlesInAnalysis.add(articleKey)
 
-        processedArticles.push(article)
+          const { metrics, summary, aiSummary, categories } = await analyzeArticle(apiArticle.title, content)
+
+          const article: Article = {
+            id: uuidv4(),
+            title: apiArticle.title,
+            summary: summary,
+            content: content,
+            url: apiArticle.url,
+            imageUrl: apiArticle.urlToImage || "",
+            source: apiArticle.source.name || "Unknown",
+            publishedAt: apiArticle.publishedAt,
+            metrics,
+            analyzed: true,
+            storedAt: new Date().toISOString(),
+            aiSummary,
+            categories: categories || ["other"],
+          }
+
+          processedArticles.push(article)
+        } catch (analysisError) {
+          console.error(`Failed to analyze article: ${apiArticle.title}`, analysisError)
+          errors.push(`Failed to analyze article: ${apiArticle.title}`)
+        } finally {
+          articlesInAnalysis.delete(articleKey)
+        }
       } catch (error) {
-        console.error('Error processing article:', error)
-        errors.push(`Failed to process article: ${error instanceof Error ? error.message : 'Unknown error'}`)
+        console.error("Error processing article:", error)
+        errors.push(`Failed to process article: ${error instanceof Error ? error.message : "Unknown error"}`)
       }
     }
 
     return { articles: processedArticles, errors }
   } catch (error: unknown) {
-    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    const errorMessage = error instanceof Error ? error.message : "Unknown error"
     console.error(`Error in searchArticles: ${errorMessage}`)
     return { articles: [], errors: [errorMessage] }
   }
@@ -175,161 +157,140 @@ export async function fetchTopHeadlines(
   size = 5,
 ): Promise<{ articles: Article[]; errors: string[] }> {
   try {
-    console.log(
-      `Fetching top headlines: country=${country}, category=${category}, size=${size}`
-    )
+    console.log(`Fetching top headlines: country=${country}, category=${category}, size=${size}`)
 
-    const apiKey = process.env.NEWSDATA_API_KEY
+    const apiKey = process.env.NEWS_ORG_API_KEY
 
     if (!apiKey) {
-      throw new Error(
-        "NewsData.io API key is missing. Please add NEWSDATA_API_KEY to your environment variables."
-      )
+      throw new Error("NewsAPI.org API key is missing. Please add NEWS_ORG_API_KEY to your environment variables.")
     }
 
-    // Build the URL with query parameters
-    const url = new URL(NEWS_DATA_URL)
-    url.searchParams.append("apikey", apiKey)
+    const url = new URL(TOP_HEADLINES_URL)
+    url.searchParams.append("apiKey", apiKey)
     url.searchParams.append("country", country)
     if (category) url.searchParams.append("category", category.toLowerCase())
-    url.searchParams.append("size", size.toString())
-    url.searchParams.append("language", "hu")
+    url.searchParams.append("pageSize", size.toString())
 
-    console.log(`Making request to NewsData.io: ${url.toString()}`)
+    console.log(`Making request to NewsAPI.org: ${url.toString()}`)
 
     const response = await fetch(url.toString())
 
     if (!response.ok) {
       const errorData = await response.json().catch(() => ({}))
-      throw new Error(
-        `NewsData.io error: ${errorData.message || response.statusText}`
-      )
+      throw new Error(`NewsAPI.org error: ${errorData.message || response.statusText}`)
     }
 
-    const data: NewsDataResponse = await response.json()
-    console.log(`Received ${data.results?.length || 0} articles from NewsData.io`)
+    const data: NewsApiResponse = await response.json()
+    console.log(`Received ${data.articles?.length || 0} articles from NewsAPI.org`)
 
-    if (data.status !== "success") {
-      throw new Error(`NewsData.io error: ${data.message || 'Unknown error'}`)
+    if (data.status !== "ok") {
+      throw new Error(`NewsAPI.org error: ${data.message || "Unknown error"}`)
     }
 
-    // Process articles
     const processedArticles: Article[] = []
     const errors: string[] = []
 
-    for (const article of data.results || []) {
+    for (const article of data.articles || []) {
       try {
-        // Generate a unique ID for the article
-        const id = article.article_id || uuidv4()
+        // Create a unique ID based on URL
+        const id = Buffer.from(article.url).toString("base64").substring(0, 16)
         const content = article.content || article.description || ""
 
-        // Map NewsData.io categories to our categories
+        // Check if this article is already being processed
+        if (isArticleBeingProcessed(id) || articlesInAnalysis.has(id)) {
+          console.log(`Article ${id} is already being processed, skipping`)
+          continue
+        }
+
+        // Check if article already exists - use try/catch to handle errors
+        let existingArticle = null
+        try {
+          existingArticle = await getArticleFromBlob(id)
+        } catch (error) {
+          console.log(
+            `Error checking for existing article ${id}: ${error instanceof Error ? error.message : "Unknown error"}`,
+          )
+          // Continue with creating a new article
+        }
+
+        if (existingArticle) {
+          console.log(`Article ${id} already exists, adding to results`)
+          processedArticles.push(existingArticle)
+          continue
+        }
+
+        // Skip articles without content
+        if (!content) {
+          console.log(`Skipping article with no content: ${article.title}`)
+          continue
+        }
+
         const mapCategory = (cat: string): ArticleCategory => {
           const lowerCat = cat.toLowerCase()
-          if (["sports", "sport"].includes(lowerCat)) return 'sport'
-          if (["business", "economics", "economy"].includes(lowerCat)) return 'economy'
-          if (["politics"].includes(lowerCat)) return 'politics'
-          if (["war", "conflict"].includes(lowerCat)) return 'war'
-          if (["technology", "tech"].includes(lowerCat)) return 'technology'
-          if (["science"].includes(lowerCat)) return 'science'
-          if (["religion", "faith"].includes(lowerCat)) return 'religion'
-          if (["work", "jobs", "career"].includes(lowerCat)) return 'work'
-          if (["travel", "tourism"].includes(lowerCat)) return 'travel'
-          if (["health", "medicine", "healthcare"].includes(lowerCat)) return 'health'
-          if (["entertainment", "celebrities", "movies", "music"].includes(lowerCat)) return 'entertainment'
-          if (["education"].includes(lowerCat)) return 'education'
-          if (["environment", "climate"].includes(lowerCat)) return 'environment'
-          if (["fashion", "style"].includes(lowerCat)) return 'fashion'
-          if (["food", "cooking", "restaurants"].includes(lowerCat)) return 'food'
-          if (["lifestyle"].includes(lowerCat)) return 'lifestyle'
-          return 'other'
+          if (["sports", "sport"].includes(lowerCat)) return "sport"
+          if (["business", "economics", "economy"].includes(lowerCat)) return "economy"
+          if (["politics"].includes(lowerCat)) return "politics"
+          if (["war", "conflict"].includes(lowerCat)) return "war"
+          if (["technology", "tech"].includes(lowerCat)) return "technology"
+          if (["science"].includes(lowerCat)) return "science"
+          if (["religion", "faith"].includes(lowerCat)) return "religion"
+          if (["work", "jobs", "career"].includes(lowerCat)) return "work"
+          if (["travel", "tourism"].includes(lowerCat)) return "travel"
+          if (["health", "medicine", "healthcare"].includes(lowerCat)) return "health"
+          if (["entertainment", "celebrities", "movies", "music"].includes(lowerCat)) return "entertainment"
+          if (["education"].includes(lowerCat)) return "education"
+          if (["environment", "climate"].includes(lowerCat)) return "environment"
+          if (["fashion", "style"].includes(lowerCat)) return "fashion"
+          if (["food", "cooking", "restaurants"].includes(lowerCat)) return "food"
+          if (["lifestyle"].includes(lowerCat)) return "lifestyle"
+          return "other"
         }
 
-        // Get categories from article or use default
-        const categories: ArticleCategory[] = (article.category?.length > 0 
-          ? [...new Set(article.category.map(mapCategory))]
-              .filter((cat): cat is ArticleCategory => 
-                ['sport', 'economy', 'politics', 'war', 'technology', 'religion', 
-                 'work', 'travel', 'health', 'entertainment', 'science', 'education', 
-                 'environment', 'fashion', 'food', 'lifestyle', 'other'].includes(cat)
-              )
-              .slice(0, 3) // Limit to 3 categories
-          : ['other'])
+        // Map NewsAPI.org category to our categories
+        const categories: ArticleCategory[] = category ? [mapCategory(category)] : ["other"]
 
-        // Create the article object first (unanalyzed)
-        const newArticle: Article = {
-          id,
-          title: article.title,
-          summary: article.description || "",
-          content: content,
-          url: article.link,
-          imageUrl: article.image_url || "",
-          source: article.source_id || "Unknown",
-          publishedAt: article.pubDate,
-          metrics: {
-            clickbaitScore: 0,
-            biasScore: 0,
-            targetGeneration: "",
-            politicalLeaning: "",
-            sentimentScore: 0,
-            sentimentTone: "neutral",
-            readabilityScore: 0,
-            readingLevel: "",
-            emotionalTone: "neutral",
-            engagementScore: 0,
-            bias: 0,
-          },
-          analyzed: false, // Mark as unanalyzed initially
-          categories: categories
-        }
+        // Start analysis immediately and wait for it to complete
+        if (!articlesInAnalysis.has(id)) {
+          articlesInAnalysis.add(id)
 
-        try {
-          const articleIdToCheck = article.article_id || article.link;
-          
-          // Check if we already have this article in our storage using article_id
-          if (typeof getArticleFromBlob === 'function') {
-            const existingArticle = await getArticleFromBlob(articleIdToCheck);
-            if (existingArticle) {
-              console.log(`Article already exists in storage: ${articleIdToCheck}`);
-              // Only add to processed articles if it's not already there
-              if (!processedArticles.some(a => (a.id === existingArticle.id) || (a.url === existingArticle.url))) {
-                processedArticles.push(existingArticle);
-              }
-              continue;
+          console.log(`Starting analysis for: ${article.title}`)
+
+          try {
+            const {
+              metrics,
+              summary,
+              aiSummary,
+              categories: analyzedCategories,
+            } = await analyzeArticle(article.title, content)
+
+            // Create article only after successful analysis
+            const analyzedArticle: Article = {
+              id,
+              title: article.title,
+              summary: summary,
+              content: content,
+              url: article.url,
+              imageUrl: article.urlToImage || "",
+              source: article.source.name || "Unknown",
+              publishedAt: article.publishedAt,
+              metrics,
+              analyzed: true,
+              categories: analyzedCategories && analyzedCategories.length > 0 ? analyzedCategories : categories,
+              aiSummary,
             }
+
+            // Store the analyzed article
+            await storeArticle(analyzedArticle)
+            console.log(`Successfully analyzed and stored: ${article.title}`)
+
+            processedArticles.push(analyzedArticle)
+          } catch (analysisError) {
+            console.error(`Analysis failed for ${article.title}:`, analysisError)
+            errors.push(`Failed to analyze article: ${article.title}`)
+            // Don't add the article to processedArticles if analysis fails
+          } finally {
+            articlesInAnalysis.delete(id)
           }
-
-          // Check if we've already processed an article with the same URL in this batch
-          const isDuplicateInBatch = processedArticles.some(a => 
-            a.url === newArticle.url || 
-            (a.title === newArticle.title && a.source === newArticle.source)
-          );
-          
-          if (isDuplicateInBatch) {
-            console.log(`Skipping duplicate article in batch: ${article.title}`);
-            continue;
-          }
-
-          // Store the unanalyzed article first to prevent duplicates
-          await storeArticle(newArticle);
-          console.log(`Stored unanalyzed article: ${article.title}`);
-
-          // Add to in-progress set to prevent duplicate analysis
-          articlesInProgress.add(articleIdToCheck);
-
-          // Start analysis in the background if we have content
-          if (content) {
-            analyzeArticleInBackground(newArticle, article.title, content)
-              .catch((error) => {
-                console.error(`Error analyzing article: ${error}`);
-                errors.push(`Failed to analyze article: ${article.title}`);
-              });
-          }
-
-          processedArticles.push(newArticle);
-        } catch (storageError) {
-          console.error("Error storing article:", storageError)
-          errors.push(`Failed to store article: ${article.title}`)
         }
       } catch (error) {
         const errorMessage = `Error processing article "${article.title || "Unknown"}": ${error instanceof Error ? error.message : "Unknown error"}`
@@ -339,7 +300,7 @@ export async function fetchTopHeadlines(
     }
 
     console.log(
-      `Finished processing articles. Returning ${processedArticles.length} processed articles with ${errors.length} errors.`,
+      `Finished processing articles. Returning ${processedArticles.length} analyzed articles with ${errors.length} errors.`,
     )
     return { articles: processedArticles, errors }
   } catch (error) {
@@ -348,64 +309,5 @@ export async function fetchTopHeadlines(
       articles: [],
       errors: [`Failed to fetch articles: ${error instanceof Error ? error.message : "Unknown error"}`],
     }
-  }
-}
-
-// Analyze article in the background and update Blob storage
-async function analyzeArticleInBackground(article: Article, title: string, content: string) {
-  const articleId = article.id;
-  
-  try {
-    console.log(`Starting background AI analysis for article: "${title.substring(0, 30)}..."`)
-
-    // Add a delay to avoid rate limiting
-    await delay(1000)
-    
-    try {
-      // Analyze the article content
-      const { metrics, summary, aiSummary, categories } = await analyzeArticle(article.title, content)
-
-      console.log(`Analysis successful for article: "${title.substring(0, 30)}..."`)
-      console.log(`Categories: ${JSON.stringify(categories)}`)
-      console.log(`Metrics: ${JSON.stringify(metrics, null, 2)}`)
-
-      // Update the article with analysis results
-      const updatedArticle: Article = {
-        ...article,
-        metrics: {
-          ...article.metrics,
-          ...metrics,
-        },
-        summary: summary || article.summary,
-        aiSummary: aiSummary || "",
-        analyzed: true,
-        // Use categories from AI analysis, fallback to existing categories if none
-        categories: (categories && categories.length > 0) 
-          ? (categories as ArticleCategory[]) 
-          : (article.categories || ['other'] as ArticleCategory[])
-      }
-
-      // Store the updated article in Blob storage
-      await storeArticle(updatedArticle)
-      console.log(`Successfully stored analyzed article: "${title.substring(0, 30)}..."`)
-      
-      return updatedArticle
-    } catch (error) {
-      console.error(`Error analyzing article "${title.substring(0, 30)}...":`, error)
-      // If analysis fails, ensure we still have a default category
-      const updatedArticle: Article = {
-        ...article,
-        analyzed: true,
-        categories: (article.categories?.length ? article.categories : ['other']) as ArticleCategory[]
-      }
-      await storeArticle(updatedArticle)
-      return updatedArticle
-    }
-  } catch (error) {
-    console.error(`Error in analyzeArticleInBackground for article "${title.substring(0, 30)}...":`, error)
-    throw error // Re-throw to be caught by the caller
-  } finally {
-    // Always remove from in-progress set when done
-    articlesInProgress.delete(articleId);
   }
 }
