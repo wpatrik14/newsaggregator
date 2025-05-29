@@ -655,14 +655,11 @@ export default function ArticleList() {
                       }}
                     />
                     <CardContent className="p-4 flex-1 flex flex-col">
-                      <div className="mb-2 flex flex-col gap-2">
-                        <div className="flex items-center gap-2">
-                          <Badge variant="outline">{article.source}</Badge>
-                          <span className="text-xs text-muted-foreground">
-                            {formatDistanceToNow(new Date(article.publishedAt), { addSuffix: true })}
-                          </span>
-                        </div>
-                        <ArticleCategories categories={article.categories} />
+                      <div className="mb-2 flex items-center gap-2">
+                        <Badge variant="outline">{article.source}</Badge>
+                        <span className="text-xs text-muted-foreground">
+                          {formatDistanceToNow(new Date(article.publishedAt), { addSuffix: true })}
+                        </span>
                       </div>
                       <div className="flex justify-between items-start gap-2 mb-2">
                         <h2 className="text-xl font-bold hover:text-primary transition-colors flex-1">
@@ -694,7 +691,7 @@ export default function ArticleList() {
                         </Tooltip>
                       </div>
                       <div className="space-y-2">
-                        {/* Article Categories */}
+                        {/* Show categories below the title */}
                         {article.categories && article.categories.length > 0 && (
                           <ArticleCategories categories={article.categories} className="mb-2" />
                         )}
