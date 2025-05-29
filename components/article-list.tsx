@@ -1,6 +1,6 @@
 "use client"
 
-import { useEffect, useState, useCallback } from "react"
+import { useEffect, useState, useCallback, useRef } from "react"
 import { Card, CardContent, CardFooter } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
 import { formatDistanceToNow } from "date-fns"
@@ -12,12 +12,14 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import { toast } from "@/hooks/use-toast"
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip"
+import ArticleCategories from "./article-categories"
 
 interface ArticleListState {
   articles: Article[];
   filteredArticles: Article[];
   isLoading: boolean;
   isRefreshing: boolean;
+  isPolling: boolean;
   isDeleting: boolean;
   error: string | null;
   analysisErrors: string[];
@@ -279,6 +281,7 @@ export default function ArticleList() {
     filteredArticles: [],
     isLoading: true,
     isRefreshing: false,
+    isPolling: false,
     isDeleting: false,
     error: null,
     analysisErrors: []
@@ -305,12 +308,13 @@ export default function ArticleList() {
   const setFilteredArticles = (filteredArticles: Article[]) => setState(prev => ({ ...prev, filteredArticles }));
   const setIsLoading = (isLoading: boolean) => setState(prev => ({ ...prev, isLoading }));
   const setIsRefreshing = (isRefreshing: boolean) => setState(prev => ({ ...prev, isRefreshing }));
+  const setIsPolling = (isPolling: boolean) => setState(prev => ({ ...prev, isPolling }));
   const setIsDeleting = (isDeleting: boolean) => setState(prev => ({ ...prev, isDeleting }));
   const setError = (error: string | null) => setState(prev => ({ ...prev, error }));
   const setAnalysisErrors = (analysisErrors: string[]) => setState(prev => ({ ...prev, analysisErrors }));
   
   // Destructure state for easier access
-  const { articles, filteredArticles, isLoading, isRefreshing, isDeleting, error, analysisErrors } = state;
+  const { articles, filteredArticles, isLoading, isRefreshing, isPolling, isDeleting, error, analysisErrors } = state;
   
   // Handle toast notifications in a separate effect
   useEffect(() => {
@@ -366,10 +370,12 @@ export default function ArticleList() {
   }
 
   // Fetch articles with proper TypeScript types and error handling
-  const fetchArticles = useCallback(async (loadMore = false) => {
+  const fetchArticles = useCallback(async (loadMore = false, isPollingCall = false) => {
     try {
-      // Set loading states
-      if (loadMore) {
+      // Set appropriate loading states
+      if (isPollingCall) {
+        setIsPolling(true);
+      } else if (loadMore) {
         setIsRefreshing(true);
       } else {
         setIsLoading(true);
@@ -462,35 +468,48 @@ export default function ArticleList() {
         description: errorMessage,
       }]);
     } finally {
-      setIsLoading(false);
-      setIsRefreshing(false);
+      if (isPollingCall) {
+        setIsPolling(false);
+      } else {
+        setIsLoading(false);
+        setIsRefreshing(false);
+      }
     }
   }, [filters.category, filters.country]); // Recreate when filters.category or filters.country changes
 
-  // Poll for updates to check if unanalyzed articles have been analyzed
-  useEffect(() => {
-    // Only poll if there are unanalyzed articles
-    const hasUnanalyzedArticles = articles.some((article) => article.analyzed === false);
-
-    if (!hasUnanalyzedArticles) return;
-
-    const pollInterval = setInterval(() => {
-      // Only fetch if we're not already loading or refreshing
-      if (!isLoading && !isRefreshing) {
-        fetchArticles()
-      }
-    }, 5000) // Poll every 5 seconds
-
-    return () => clearInterval(pollInterval)
-  }, [articles, isLoading, isRefreshing])
+  // Track if initial fetch has been done
+  const initialFetchDone = useRef(false);
 
   // Fetch articles when component mounts (only if not already loaded) or when category filter changes
   useEffect(() => {
-    // Only fetch if we don't have any articles yet
-    if (articles.length === 0) {
-      fetchArticles()
+    // Only fetch if we don't have any articles yet and we haven't done the initial fetch
+    if (articles.length === 0 && !initialFetchDone.current) {
+      initialFetchDone.current = true;
+      fetchArticles();
     }
-  }, [filters.category])
+  }, [articles.length, filters.category]);
+
+  // Poll for updates to check if unanalyzed articles have been analyzed
+  useEffect(() => {
+    // Only poll if there are unanalyzed articles and we're not already loading/refreshing
+    const hasUnanalyzedArticles = articles.some(article => article.analyzed === false);
+    
+    if (!hasUnanalyzedArticles || isLoading || isRefreshing || isPolling) return;
+
+    // Don't start polling immediately, wait for the initial fetch to complete
+    const timer = setTimeout(() => {
+      const pollInterval = setInterval(() => {
+        // Only fetch if we're not already in any loading state
+        if (!isLoading && !isRefreshing && !isPolling) {
+          fetchArticles(false, true); // Pass true to indicate this is a polling call
+        }
+      }, 10000); // Poll every 10 seconds
+
+      return () => clearInterval(pollInterval);
+    }, 5000); // Start polling 5 seconds after the initial fetch
+
+    return () => clearTimeout(timer);
+  }, [articles, isLoading, isRefreshing, isPolling, fetchArticles]);
 
   // Apply filters whenever they change or articles change
   useEffect(() => {
@@ -543,7 +562,7 @@ export default function ArticleList() {
     setFilteredArticles(filtered)
   }, [articles, filters])
 
-  if (isLoading) {
+  if (isLoading && !isPolling) {
     return (
       <div className="flex h-40 items-center justify-center">
         <div className="text-center">
@@ -668,11 +687,14 @@ export default function ArticleList() {
                     </div>
                   </div>
                   <CardContent className="p-4">
-                    <div className="mb-2 flex items-center gap-2">
-                      <Badge variant="outline">{article.source}</Badge>
-                      <span className="text-xs text-muted-foreground">
-                        {formatDistanceToNow(new Date(article.publishedAt), { addSuffix: true })}
-                      </span>
+                    <div className="mb-2 flex flex-col gap-2">
+                      <div className="flex items-center gap-2">
+                        <Badge variant="outline">{article.source}</Badge>
+                        <span className="text-xs text-muted-foreground">
+                          {formatDistanceToNow(new Date(article.publishedAt), { addSuffix: true })}
+                        </span>
+                      </div>
+                      <ArticleCategories categories={article.categories} />
                     </div>
                     <h2 className="mb-2 line-clamp-2 text-xl font-bold">{article.title}</h2>
                     <p className="line-clamp-3 text-sm text-muted-foreground">{article.summary}</p>
@@ -700,11 +722,14 @@ export default function ArticleList() {
                     }}
                   />
                   <CardContent className="p-4 flex-1 flex flex-col">
-                    <div className="mb-2 flex items-center gap-2">
-                      <Badge variant="outline">{article.source}</Badge>
-                      <span className="text-xs text-muted-foreground">
-                        {formatDistanceToNow(new Date(article.publishedAt), { addSuffix: true })}
-                      </span>
+                    <div className="mb-2 flex flex-col gap-2">
+                      <div className="flex items-center gap-2">
+                        <Badge variant="outline">{article.source}</Badge>
+                        <span className="text-xs text-muted-foreground">
+                          {formatDistanceToNow(new Date(article.publishedAt), { addSuffix: true })}
+                        </span>
+                      </div>
+                      <ArticleCategories categories={article.categories} />
                     </div>
                     <div className="flex justify-between items-start gap-2 mb-2">
                       <h2 className="text-xl font-bold hover:text-primary transition-colors flex-1">
@@ -740,6 +765,13 @@ export default function ArticleList() {
                       </Tooltip>
                     </div>
                     <div className="space-y-2">
+                      {/* Article Categories */}
+                      {article.categories && article.categories.length > 0 && (
+                        <ArticleCategories 
+                          categories={article.categories} 
+                          className="mb-2"
+                        />
+                      )}
                       <p className="line-clamp-4 text-sm text-muted-foreground">
                         {article.summary || 'No summary available.'}
                       </p>

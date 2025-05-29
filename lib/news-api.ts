@@ -1,31 +1,34 @@
 import type { Article } from "@/types/article"
 import { v4 as uuidv4 } from "uuid"
 import { analyzeArticle } from "./ai"
-import { storeArticle } from "./blob-storage"
+import { storeArticle, getArticleFromBlob } from "./blob-storage"
+import { ArticleCategory } from "@/types/article"
 
-// News API endpoints
-const TOP_HEADLINES_URL = "https://newsapi.org/v2/top-headlines"
-const EVERYTHING_URL = "https://newsapi.org/v2/everything"
+// NewsData.io API endpoints
+const NEWS_DATA_URL = "https://newsdata.io/api/1/news"
 
-// News API response types
-interface NewsApiArticle {
-  source: {
-    id: string | null
-    name: string
-  }
-  author: string | null
+// NewsData.io response types
+interface NewsDataArticle {
+  article_id: string
   title: string
-  description: string | null
-  url: string
-  urlToImage: string | null
-  publishedAt: string
+  link: string
+  description: string
   content: string | null
+  pubDate: string
+  image_url: string | null
+  source_id: string
+  source_priority: number
+  country: string[]
+  category: string[]
+  language: string
+  creator: string[] | null
 }
 
-interface NewsApiResponse {
+interface NewsDataResponse {
   status: string
   totalResults: number
-  articles: NewsApiArticle[]
+  results: NewsDataArticle[]
+  nextPage?: number
   code?: string
   message?: string
 }
@@ -39,143 +42,286 @@ let currentPage = 1
 // Track articles being analyzed to prevent duplicates
 const articlesInProgress = new Set<string>()
 
-// Fetch top headlines from News API
-export async function fetchTopHeadlines(
-  country = "us",
-  category?: string,
-  pageSize = 5, // Changed to 5 articles
-  page?: number, // Make page optional
+// Search for articles using NewsData.io API
+export async function searchArticles(
+  query: string,
+  from?: string,
+  to?: string,
+  sortBy: "relevancy" | "popularity" | "publishedAt" = "publishedAt",
+  size: number = 20
 ): Promise<{ articles: Article[]; errors: string[] }> {
-  // If page is not provided, use the next page
-  const pageToFetch = page || currentPage++
-  
-  // Reset to page 1 if we've gone too far (News API has a limit)
-  if (pageToFetch > 5) {
-    currentPage = 1
-  }
   try {
-    console.log(`Fetching top headlines: country=${country}, category=${category || "all"}`)
+    console.log(`Searching articles: query=${query}, from=${from}, to=${to}, sortBy=${sortBy}, size=${size}`)
 
-    const apiKey = process.env.NEWS_ORG_API_KEY
+    const apiKey = process.env.NEWSDATA_API_KEY
 
     if (!apiKey) {
-      throw new Error("News API key is missing. Please add NEWS_ORG_API_KEY to your environment variables.")
+      throw new Error("NewsData.io API key is missing. Please add NEWSDATA_API_KEY to your environment variables.")
     }
 
     // Build the URL with query parameters
-    const url = new URL(TOP_HEADLINES_URL)
-    url.searchParams.append("country", country)
-    if (category && category !== "all") {
-      url.searchParams.append("category", category)
-    }
-    url.searchParams.append("pageSize", pageSize.toString())
-    url.searchParams.append("page", pageToFetch.toString())
+    const url = new URL(NEWS_DATA_URL)
+    url.searchParams.append("apikey", apiKey)
+    url.searchParams.append("q", query)
     
-    console.log(`Fetching page ${pageToFetch} of results`)
-
-    // Make the request to News API
-    console.log(`Making request to News API: ${url.toString()}`)
-    const response = await fetch(url.toString(), {
-      headers: {
-        "X-Api-Key": apiKey,
-      },
-    })
+    if (from) url.searchParams.append("from_date", from)
+    if (to) url.searchParams.append("to_date", to)
+    
+    // Map sortBy to NewsData.io's format
+    const sortMap = {
+      relevancy: "relevancy",
+      popularity: "popularity",
+      publishedAt: "published_desc"
+    }
+    url.searchParams.append("sort", sortMap[sortBy] || "published_desc")
+    
+    url.searchParams.append("size", size.toString())
+    url.searchParams.append("language", "hu") // Limit to Hungarian articles
+    
+    console.log(`Making search request to NewsData.io: ${url.toString()}`)
+    
+    const response = await fetch(url.toString())
 
     if (!response.ok) {
       const errorData = await response.json().catch(() => ({}))
-      throw new Error(`News API error: ${errorData.message || response.statusText}`)
+      throw new Error(`NewsData.io error: ${errorData.message || response.statusText}`)
     }
 
-    const data: NewsApiResponse = await response.json()
-    console.log(`Received ${data.articles.length} articles from News API`)
+    const data: NewsDataResponse = await response.json()
+    console.log(`Received ${data.results?.length || 0} articles from NewsData.io search`)
 
-    if (data.status === "error") {
-      throw new Error(`News API error: ${data.message}`)
+    if (data.status !== "success") {
+      throw new Error(`NewsData.io error: ${data.message || 'Unknown error'}`)
     }
 
     // Process articles
     const processedArticles: Article[] = []
     const errors: string[] = []
 
-    // Limit to 5 articles
-    const articlesToProcess = data.articles.slice(0, 5)
-    console.log(`Processing ${articlesToProcess.length} articles`)
-
-    // Process articles sequentially
-    for (const article of articlesToProcess) {
+    for (const apiArticle of data.results || []) {
       try {
-        // Skip articles with missing essential data
-        if (!article.title) {
-          console.log("Skipping article with missing title")
+        // Skip if we've already processed this article
+        const articleKey = `${apiArticle.source_id}-${apiArticle.article_id}`
+        if (articlesInProgress.has(articleKey)) {
+          console.log(`Skipping article already being processed: ${articleKey}`)
           continue
         }
 
-        console.log(`Processing article: "${article.title.substring(0, 30)}..."`)
+        articlesInProgress.add(articleKey)
 
-        // Create a unique ID for the article
-        const id = uuidv4()
+        const article: Article = {
+          id: apiArticle.article_id || uuidv4(),
+          title: apiArticle.title,
+          summary: apiArticle.description || '',
+          content: apiArticle.content || apiArticle.description || '',
+          url: apiArticle.link,
+          imageUrl: apiArticle.image_url || '',
+          source: apiArticle.source_id || 'Unknown',
+          publishedAt: apiArticle.pubDate,
+          metrics: {
+            clickbaitScore: 0,
+            biasScore: 0,
+            targetGeneration: '',
+            politicalLeaning: '',
+            sentimentScore: 0,
+            sentimentTone: 'neutral',
+            readabilityScore: 0,
+            readingLevel: '',
+            emotionalTone: 'neutral',
+            engagementScore: 0,
+            bias: 0,
+          },
+          analyzed: false,
+          storedAt: new Date().toISOString(),
+          categories: (apiArticle.category?.length 
+            ? apiArticle.category
+                .map(c => {
+                  const lowerCased = c.toLowerCase();
+                  // Only include categories that match our ArticleCategory type
+                  if ([
+                    'sport', 'economy', 'politics', 'war', 'technology', 'religion', 
+                    'work', 'travel', 'health', 'entertainment', 'science', 'education', 
+                    'environment', 'fashion', 'food', 'lifestyle', 'other'
+                  ].includes(lowerCased)) {
+                    return lowerCased as ArticleCategory;
+                  }
+                  return 'other';
+                })
+                .filter((cat, index, arr) => arr.indexOf(cat) === index) // Remove duplicates
+                .slice(0, 3) // Limit to 3 categories
+            : ['other']
+          ) as ArticleCategory[]
+        }
 
-        // Extract content and clean it up
+
+        processedArticles.push(article)
+      } catch (error) {
+        console.error('Error processing article:', error)
+        errors.push(`Failed to process article: ${error instanceof Error ? error.message : 'Unknown error'}`)
+      }
+    }
+
+    return { articles: processedArticles, errors }
+  } catch (error: unknown) {
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    console.error(`Error in searchArticles: ${errorMessage}`)
+    return { articles: [], errors: [errorMessage] }
+  }
+}
+
+export async function fetchTopHeadlines(
+  country = "us",
+  category?: string,
+  size = 5,
+): Promise<{ articles: Article[]; errors: string[] }> {
+  try {
+    console.log(
+      `Fetching top headlines: country=${country}, category=${category}, size=${size}`
+    )
+
+    const apiKey = process.env.NEWSDATA_API_KEY
+
+    if (!apiKey) {
+      throw new Error(
+        "NewsData.io API key is missing. Please add NEWSDATA_API_KEY to your environment variables."
+      )
+    }
+
+    // Build the URL with query parameters
+    const url = new URL(NEWS_DATA_URL)
+    url.searchParams.append("apikey", apiKey)
+    url.searchParams.append("country", country)
+    if (category) url.searchParams.append("category", category.toLowerCase())
+    url.searchParams.append("size", size.toString())
+    url.searchParams.append("language", "hu")
+
+    console.log(`Making request to NewsData.io: ${url.toString()}`)
+
+    const response = await fetch(url.toString())
+
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({}))
+      throw new Error(
+        `NewsData.io error: ${errorData.message || response.statusText}`
+      )
+    }
+
+    const data: NewsDataResponse = await response.json()
+    console.log(`Received ${data.results?.length || 0} articles from NewsData.io`)
+
+    if (data.status !== "success") {
+      throw new Error(`NewsData.io error: ${data.message || 'Unknown error'}`)
+    }
+
+    // Process articles
+    const processedArticles: Article[] = []
+    const errors: string[] = []
+
+    for (const article of data.results || []) {
+      try {
+        // Generate a unique ID for the article
+        const id = article.article_id || uuidv4()
         const content = article.content || article.description || ""
-        const cleanContent = content.replace(/\[\+\d+ chars\]$/, "")
+
+        // Map NewsData.io categories to our categories
+        const mapCategory = (cat: string): ArticleCategory => {
+          const lowerCat = cat.toLowerCase()
+          if (["sports", "sport"].includes(lowerCat)) return 'sport'
+          if (["business", "economics", "economy"].includes(lowerCat)) return 'economy'
+          if (["politics"].includes(lowerCat)) return 'politics'
+          if (["war", "conflict"].includes(lowerCat)) return 'war'
+          if (["technology", "tech"].includes(lowerCat)) return 'technology'
+          if (["science"].includes(lowerCat)) return 'science'
+          if (["religion", "faith"].includes(lowerCat)) return 'religion'
+          if (["work", "jobs", "career"].includes(lowerCat)) return 'work'
+          if (["travel", "tourism"].includes(lowerCat)) return 'travel'
+          if (["health", "medicine", "healthcare"].includes(lowerCat)) return 'health'
+          if (["entertainment", "celebrities", "movies", "music"].includes(lowerCat)) return 'entertainment'
+          if (["education"].includes(lowerCat)) return 'education'
+          if (["environment", "climate"].includes(lowerCat)) return 'environment'
+          if (["fashion", "style"].includes(lowerCat)) return 'fashion'
+          if (["food", "cooking", "restaurants"].includes(lowerCat)) return 'food'
+          if (["lifestyle"].includes(lowerCat)) return 'lifestyle'
+          return 'other'
+        }
+
+        // Get categories from article or use default
+        const categories: ArticleCategory[] = (article.category?.length > 0 
+          ? [...new Set(article.category.map(mapCategory))]
+              .filter((cat): cat is ArticleCategory => 
+                ['sport', 'economy', 'politics', 'war', 'technology', 'religion', 
+                 'work', 'travel', 'health', 'entertainment', 'science', 'education', 
+                 'environment', 'fashion', 'food', 'lifestyle', 'other'].includes(cat)
+              )
+              .slice(0, 3) // Limit to 3 categories
+          : ['other'])
 
         // Create the article object first (unanalyzed)
         const newArticle: Article = {
           id,
           title: article.title,
           summary: article.description || "",
-          content: `<p>${cleanContent}</p>`,
-          url: article.url,
-          imageUrl: article.urlToImage || "/placeholder.svg?height=400&width=600",
-          source: article.source.name,
-          publishedAt: article.publishedAt,
+          content: content,
+          url: article.link,
+          imageUrl: article.image_url || "",
+          source: article.source_id || "Unknown",
+          publishedAt: article.pubDate,
           metrics: {
             clickbaitScore: 0,
             biasScore: 0,
             targetGeneration: "",
             politicalLeaning: "",
             sentimentScore: 0,
-            sentimentTone: "",
+            sentimentTone: "neutral",
             readabilityScore: 0,
             readingLevel: "",
-            emotionalTone: "",
+            emotionalTone: "neutral",
+            engagementScore: 0,
+            bias: 0,
           },
           analyzed: false, // Mark as unanalyzed initially
+          categories: categories
         }
 
         try {
-          // Add the unanalyzed article to the response
-          processedArticles.push(newArticle)
-
-          // Start the analysis in the background if not already in progress
-          const articleKey = `${article.source.name}-${article.title}`;
-          if (!articlesInProgress.has(articleKey)) {
-            articlesInProgress.add(articleKey);
-            
-            // Use a small delay to ensure the article is added to storage first
-            setTimeout(async () => {
-              try {
-                await analyzeArticleInBackground(newArticle, article.title, cleanContent);
-              } catch (error) {
-                console.error(`Background analysis error for "${article.title.substring(0, 30)}...":`, error);
-              } finally {
-                // Remove from in-progress set when done
-                articlesInProgress.delete(articleKey);
-              }
-            }, 100);
+          // Check if we already have this article in our storage using article_id
+          if (typeof getArticleFromBlob === 'function') {
+            // First try to find by article_id if available
+            const articleIdToCheck = article.article_id || article.link;
+            const existingArticle = await getArticleFromBlob(articleIdToCheck);
+            if (existingArticle) {
+              console.log(`Article already exists in storage: ${articleIdToCheck}`);
+              processedArticles.push(existingArticle);
+              continue;
+            }
           }
+
+          // Store the unanalyzed article first to prevent duplicates
+          await storeArticle(newArticle)
+          console.log(`Stored unanalyzed article: ${article.title}`)
+
+          // Add to in-progress set to prevent duplicate analysis
+          const articleIdToCheck = article.article_id || article.link;
+          articlesInProgress.add(articleIdToCheck)
+
+          // Start analysis in the background if we have content
+          if (content) {
+            analyzeArticleInBackground(newArticle, article.title, content)
+              .catch((error) => {
+                console.error(`Error analyzing article: ${error}`)
+                errors.push(`Failed to analyze article: ${article.title}`)
+              })
+          }
+
+          processedArticles.push(newArticle)
         } catch (storageError) {
-          console.error(`Error storing article in Blob storage: "${article.title.substring(0, 30)}..."`, storageError)
-          errors.push(
-            `Failed to store article "${article.title}": ${storageError instanceof Error ? storageError.message : "Unknown error"}`,
-          )
-          // Continue with the next article
+          console.error("Error storing article:", storageError)
+          errors.push(`Failed to store article: ${article.title}`)
         }
       } catch (error) {
-        console.error(`Error processing article "${article.title?.substring(0, 30) || "unknown"}":`, error)
-        errors.push(
-          `Error processing article "${article.title || "Unknown"}": ${error instanceof Error ? error.message : "Unknown error"}`,
-        )
+        const errorMessage = `Error processing article "${article.title || "Unknown"}": ${error instanceof Error ? error.message : "Unknown error"}`
+        console.error(errorMessage)
+        errors.push(errorMessage)
       }
     }
 
@@ -194,38 +340,59 @@ export async function fetchTopHeadlines(
 
 // Analyze article in the background and update Blob storage
 async function analyzeArticleInBackground(article: Article, title: string, content: string) {
+  const articleId = article.id;
+  
   try {
     console.log(`Starting background AI analysis for article: "${title.substring(0, 30)}..."`)
 
     // Add a delay to avoid rate limiting
     await delay(1000)
+    
+    try {
+      // Analyze the article content
+      const { metrics, summary, aiSummary, categories } = await analyzeArticle(article.title, content)
 
+      console.log(`Analysis successful for article: "${title.substring(0, 30)}..."`)
+      console.log(`Categories: ${JSON.stringify(categories)}`)
+      console.log(`Metrics: ${JSON.stringify(metrics, null, 2)}`)
 
-    // Analyze the article with AI
-    const { metrics, summary, aiSummary } = await analyzeArticle(title, content)
+      // Update the article with analysis results
+      const updatedArticle: Article = {
+        ...article,
+        metrics: {
+          ...article.metrics,
+          ...metrics,
+        },
+        summary: summary || article.summary,
+        aiSummary: aiSummary || "",
+        analyzed: true,
+        // Use categories from AI analysis, fallback to existing categories if none
+        categories: (categories && categories.length > 0) 
+          ? (categories as ArticleCategory[]) 
+          : (article.categories || ['other'] as ArticleCategory[])
+      }
 
-    console.log(`Analysis successful for article: "${title.substring(0, 30)}..."`)
-    console.log(
-      `Metrics: clickbait=${metrics.clickbaitScore}, bias=${metrics.biasScore}, target=${metrics.targetGeneration}`,
-    )
-
-    // Update the article with analysis results
-    const updatedArticle: Article = {
-      ...article,
-      metrics: {
-        ...article.metrics,
-        ...metrics,
-      },
-      summary: summary || article.summary,
-      aiSummary: aiSummary || "",
-      analyzed: true,
+      // Store the updated article in Blob storage
+      await storeArticle(updatedArticle)
+      console.log(`Successfully stored analyzed article: "${title.substring(0, 30)}..."`)
+      
+      return updatedArticle
+    } catch (error) {
+      console.error(`Error analyzing article "${title.substring(0, 30)}...":`, error)
+      // If analysis fails, ensure we still have a default category
+      const updatedArticle: Article = {
+        ...article,
+        analyzed: true,
+        categories: (article.categories?.length ? article.categories : ['other']) as ArticleCategory[]
+      }
+      await storeArticle(updatedArticle)
+      return updatedArticle
     }
-
-    // Store the updated article in Blob storage
-    await storeArticle(updatedArticle)
-    console.log(`Successfully stored analyzed article: "${title.substring(0, 30)}..."`)
   } catch (error) {
-    console.error(`Error analyzing article "${title.substring(0, 30)}...":`, error)
+    console.error(`Error in analyzeArticleInBackground for article "${title.substring(0, 30)}...":`, error)
     throw error // Re-throw to be caught by the caller
+  } finally {
+    // Always remove from in-progress set when done
+    articlesInProgress.delete(articleId);
   }
 }

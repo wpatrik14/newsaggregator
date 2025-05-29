@@ -12,6 +12,8 @@ export interface ArticleMetrics {
   bias?: number            // Added missing property
 }
 
+export type ArticleCategory = 'sport' | 'economy' | 'politics' | 'war' | 'technology' | 'religion' | 'work' | 'travel' | 'health' | 'entertainment' | 'science' | 'education' | 'environment' | 'fashion' | 'food' | 'lifestyle' | 'other'
+
 export interface Article {
   id: string
   title: string
@@ -25,4 +27,5 @@ export interface Article {
   storedAt?: string // Timestamp when the article was stored
   analyzed: boolean // Flag to indicate if the article has been analyzed
   aiSummary?: string // AI-generated summary (500 chars)
+  categories: ArticleCategory[] // Categories the article belongs to
 }

@@ -37,7 +37,9 @@ export async function generateSummary(content: string, maxLength: number = 2000)
   }
 }
 
-export async function analyzeArticle(title: string, content: string): Promise<{metrics: ArticleMetrics, summary: string, aiSummary: string}> {
+import { ArticleCategory } from "@/types/article"
+
+export async function analyzeArticle(title: string, content: string): Promise<{metrics: ArticleMetrics, summary: string, aiSummary: string, categories: ArticleCategory[]}> {
   try {
     // Check if OpenAI API key is available
     const apiKey = process.env.OPENAI_API_KEY
@@ -49,7 +51,7 @@ export async function analyzeArticle(title: string, content: string): Promise<{m
     console.log(`Starting AI analysis for article: "${title.substring(0, 30)}..."`)
 
     const prompt = `
-      Analyze the following news article and provide metrics. Respond with a JSON object containing the following fields:
+      Analyze the following news article and provide metrics and categories. Respond with a JSON object containing the following fields:
       {
         "clickbaitScore": number (0-100), // How sensational or misleading the headline/content is
         "biasScore": number (0-100), // Political or ideological bias in the article
@@ -59,7 +61,8 @@ export async function analyzeArticle(title: string, content: string): Promise<{m
         "sentimentTone": string, // e.g., "Positive", "Negative", "Neutral", "Alarming", "Hopeful"
         "readabilityScore": number (0-100), // How easy the article is to read
         "readingLevel": string, // e.g., "Elementary", "Middle School", "High School", "College", "Graduate"
-        "emotionalTone": string // Primary emotion evoked by the article
+        "emotionalTone": string, // Primary emotion evoked by the article
+        "categories": string[] // Array of categories from this list: ["sport", "economy", "politics", "war", "technology", "religion", "work", "travel", "health", "entertainment", "science", "education", "environment", "fashion", "food", "lifestyle"]
       }
 
       Article to analyze:
@@ -116,15 +119,34 @@ export async function analyzeArticle(title: string, content: string): Promise<{m
       ], 'Neutral')
     }
 
-    // Generate a detailed summary (2000 characters) and a short summary (200 characters)
-    const aiSummary = await generateSummary(content, 2000);
-    const summary = await generateSummary(content, 200);
+    // Generate AI summary
+    const aiSummary = await generateSummary(content, 500)
     
-    console.log(`Successfully analyzed article: "${title.substring(0, 30)}..."`)
+    // Extract and validate categories from AI response
+    let categories: ArticleCategory[] = []
+    if (Array.isArray(metrics.categories)) {
+      const validCategories: ArticleCategory[] = ["sport", "economy", "politics", "war", "technology", 
+        "religion", "work", "travel", "health", "entertainment", "science", 
+        "education", "environment", "fashion", "food", "lifestyle", "other"]
+      
+      categories = metrics.categories
+        .map((c: string) => c.toLowerCase() as ArticleCategory)
+        .filter((c: string): c is ArticleCategory => 
+          validCategories.includes(c as ArticleCategory)
+        )
+        .slice(0, 3) // Limit to 3 categories
+    }
+
+    // If no valid categories from AI, fallback to other
+    if (categories.length === 0) {
+      categories = ['other']
+    }
+
     return {
       metrics: result,
-      summary,
-      aiSummary
+      summary: content.substring(0, 200) + (content.length > 200 ? '...' : ''),
+      aiSummary,
+      categories
     }
   } catch (error) {
     console.error("Error analyzing article with AI:", error)
